@@ -673,6 +673,7 @@ json_lex_string(JsonLexContext *lex)
 {
 	char	   *s;
 	int			len;
+	char		*const end = lex->input + lex->input_length;
 	int			hi_surrogate = -1;
 
 	if (lex->strval != NULL)
