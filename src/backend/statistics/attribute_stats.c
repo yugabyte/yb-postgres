@@ -29,6 +29,7 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"	/* YB: needed for compilation */
 
 #define DEFAULT_NULL_FRAC      Float4GetDatum(0.0)
 #define DEFAULT_AVG_WIDTH      Int32GetDatum(0) /* unknown */
@@ -689,14 +690,11 @@ text_to_stavalues(const char *staname, FmgrInfo *array_in, Datum d, Oid typid,
 	LOCAL_FCINFO(fcinfo, 8);
 	char	   *s;
 	Datum		result;
-	ErrorSaveContext escontext = {T_ErrorSaveContext};
-
-	escontext.details_wanted = true;
 
 	s = TextDatumGetCString(d);
 
 	InitFunctionCallInfoData(*fcinfo, array_in, 3, InvalidOid,
-							 (Node *) &escontext, NULL);
+							 NULL, NULL);
 
 	fcinfo->args[0].value = CStringGetDatum(s);
 	fcinfo->args[0].isnull = false;
@@ -708,14 +706,6 @@ text_to_stavalues(const char *staname, FmgrInfo *array_in, Datum d, Oid typid,
 	result = FunctionCallInvoke(fcinfo);
 
 	pfree(s);
-
-	if (escontext.error_occurred)
-	{
-		escontext.error_data->elevel = WARNING;
-		ThrowErrorData(escontext.error_data);
-		*ok = false;
-		return (Datum) 0;
-	}
 
 	if (array_contains_nulls(DatumGetArrayTypeP(result)))
 	{
