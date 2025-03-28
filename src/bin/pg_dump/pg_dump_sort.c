@@ -877,7 +877,7 @@ repairMatViewBoundaryMultiLoop(DumpableObject *boundaryobj,
 		RelStatsInfo *nextinfo = (RelStatsInfo *) nextobj;
 
 		if (nextinfo->relkind == RELKIND_MATVIEW)
-			nextinfo->postponed_def = true;
+			nextinfo->section = SECTION_POST_DATA;
 	}
 }
 

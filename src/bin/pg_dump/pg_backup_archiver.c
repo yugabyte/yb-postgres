@@ -91,7 +91,7 @@ static void processEncodingEntry(ArchiveHandle *AH, TocEntry *te);
 static void processStdStringsEntry(ArchiveHandle *AH, TocEntry *te);
 static void processSearchPathEntry(ArchiveHandle *AH, TocEntry *te);
 static int	_tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH);
-static RestorePass _tocEntryRestorePass(TocEntry *te);
+static RestorePass _tocEntryRestorePass(ArchiveHandle *AH, TocEntry *te);
 static bool _tocEntryIsACL(TocEntry *te);
 static void _disableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te);
 static void _enableTriggersIfNecessary(ArchiveHandle *AH, TocEntry *te);
@@ -124,7 +124,8 @@ static void ready_list_insert(ParallelReadyList *ready_list, TocEntry *te);
 static void ready_list_remove(ParallelReadyList *ready_list, int i);
 static void ready_list_sort(ParallelReadyList *ready_list);
 static int	TocEntrySizeCompare(const void *p1, const void *p2);
-static void move_to_ready_list(TocEntry *pending_list,
+static void move_to_ready_list(ArchiveHandle *AH,
+							   TocEntry *pending_list,
 							   ParallelReadyList *ready_list,
 							   RestorePass pass);
 static TocEntry *pop_next_work_item(ParallelReadyList *ready_list,
@@ -701,7 +702,7 @@ RestoreArchive(Archive *AHX)
 			if ((te->reqs & (REQ_SCHEMA | REQ_DATA | REQ_STATS)) == 0)
 				continue;		/* ignore if not to be dumped at all */
 
-			switch (_tocEntryRestorePass(te))
+			switch (_tocEntryRestorePass(AH, te))
 			{
 				case RESTORE_PASS_MAIN:
 					(void) restore_toc_entry(AH, te, false);
@@ -720,7 +721,7 @@ RestoreArchive(Archive *AHX)
 			for (te = AH->toc->next; te != AH->toc; te = te->next)
 			{
 				if ((te->reqs & (REQ_SCHEMA | REQ_DATA | REQ_STATS)) != 0 &&
-					_tocEntryRestorePass(te) == RESTORE_PASS_ACL)
+					_tocEntryRestorePass(AH, te) == RESTORE_PASS_ACL)
 					(void) restore_toc_entry(AH, te, false);
 			}
 		}
@@ -730,7 +731,7 @@ RestoreArchive(Archive *AHX)
 			for (te = AH->toc->next; te != AH->toc; te = te->next)
 			{
 				if ((te->reqs & (REQ_SCHEMA | REQ_DATA | REQ_STATS)) != 0 &&
-					_tocEntryRestorePass(te) == RESTORE_PASS_POST_ACL)
+					_tocEntryRestorePass(AH, te) == RESTORE_PASS_POST_ACL)
 					(void) restore_toc_entry(AH, te, false);
 			}
 		}
@@ -3130,7 +3131,7 @@ _tocEntryRequired(TocEntry *te, teSection curSection, ArchiveHandle *AH)
  * See notes with the RestorePass typedef in pg_backup_archiver.h.
  */
 static RestorePass
-_tocEntryRestorePass(TocEntry *te)
+_tocEntryRestorePass(ArchiveHandle *AH, TocEntry *te)
 {
 	/* "ACL LANGUAGE" was a crock emitted only in PG 7.4 */
 	if (strcmp(te->desc, "ACL") == 0 ||
@@ -3150,6 +3151,26 @@ _tocEntryRestorePass(TocEntry *te)
 	if (strcmp(te->desc, "COMMENT") == 0 &&
 		strncmp(te->tag, "EVENT TRIGGER ", 14) == 0)
 		return RESTORE_PASS_POST_ACL;
+
+	/*
+	 * If statistics data is dependent on materialized view data, it must be
+	 * deferred to RESTORE_PASS_POST_ACL.
+	 */
+	if (strcmp(te->desc, "STATISTICS DATA") == 0)
+	{
+		for (int i = 0; i < te->nDeps; i++)
+		{
+			DumpId		depid = te->dependencies[i];
+
+			if (depid <= AH->maxDumpId && AH->tocsByDumpId[depid] != NULL)
+			{
+				TocEntry   *otherte = AH->tocsByDumpId[depid];
+
+				if (strcmp(otherte->desc, "MATERIALIZED VIEW DATA") == 0)
+					return RESTORE_PASS_POST_ACL;
+			}
+		}
+	}
 
 	/* All else can be handled in the main pass. */
 	return RESTORE_PASS_MAIN;
@@ -4069,7 +4090,7 @@ restore_toc_entries_prefork(ArchiveHandle *AH, TocEntry *pending_list)
 		 * not set skipped_some in this case, since by assumption no main-pass
 		 * items could depend on these.
 		 */
-		if (_tocEntryRestorePass(next_work_item) != RESTORE_PASS_MAIN)
+		if (_tocEntryRestorePass(AH, next_work_item) != RESTORE_PASS_MAIN)
 			do_now = false;
 
 		if (do_now)
@@ -4145,7 +4166,7 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 	 * process in the current restore pass.
 	 */
 	AH->restorePass = RESTORE_PASS_MAIN;
-	move_to_ready_list(pending_list, &ready_list, AH->restorePass);
+	move_to_ready_list(AH, pending_list, &ready_list, AH->restorePass);
 
 	/*
 	 * main parent loop
@@ -4194,7 +4215,7 @@ restore_toc_entries_parallel(ArchiveHandle *AH, ParallelState *pstate,
 			/* Advance to next restore pass */
 			AH->restorePass++;
 			/* That probably allows some stuff to be made ready */
-			move_to_ready_list(pending_list, &ready_list, AH->restorePass);
+			move_to_ready_list(AH, pending_list, &ready_list, AH->restorePass);
 			/* Loop around to see if anything's now ready */
 			continue;
 		}
@@ -4428,7 +4449,8 @@ TocEntrySizeCompare(const void *p1, const void *p2)
  * which applies the same logic one-at-a-time.)
  */
 static void
-move_to_ready_list(TocEntry *pending_list,
+move_to_ready_list(ArchiveHandle *AH,
+				   TocEntry *pending_list,
 				   ParallelReadyList *ready_list,
 				   RestorePass pass)
 {
@@ -4441,7 +4463,7 @@ move_to_ready_list(TocEntry *pending_list,
 		next_te = te->pending_next;
 
 		if (te->depCount == 0 &&
-			_tocEntryRestorePass(te) == pass)
+			_tocEntryRestorePass(AH, te) == pass)
 		{
 			/* Remove it from pending_list ... */
 			pending_list_remove(te);
@@ -4835,7 +4857,7 @@ reduce_dependencies(ArchiveHandle *AH, TocEntry *te,
 		 * memberships changed.
 		 */
 		if (otherte->depCount == 0 &&
-			_tocEntryRestorePass(otherte) == AH->restorePass &&
+			_tocEntryRestorePass(AH, otherte) == AH->restorePass &&
 			otherte->pending_prev != NULL &&
 			ready_list != NULL)
 		{
