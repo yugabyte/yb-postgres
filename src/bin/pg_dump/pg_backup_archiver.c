@@ -1174,6 +1174,9 @@ ArchiveEntry(Archive *AHX, CatalogId catalogId, DumpId dumpId,
 	newToc->dataDumperArg = opts->dumpArg;
 	newToc->hadDumper = opts->dumpFn ? true : false;
 
+	newToc->defnDumper = opts->defnFn;
+	newToc->defnDumperArg = opts->defnArg;
+
 	newToc->formatData = NULL;
 	newToc->dataLength = 0;
 
@@ -2540,7 +2543,45 @@ WriteToc(ArchiveHandle *AH)
 		WriteStr(AH, te->tag);
 		WriteStr(AH, te->desc);
 		WriteInt(AH, te->section);
-		WriteStr(AH, te->defn);
+
+		if (te->defnLen)
+		{
+			/*
+			 * defnLen should only be set for custom format's second call to
+			 * WriteToc(), which rewrites the TOC in place to update data
+			 * offsets.  Instead of calling the defnDumper a second time
+			 * (which could involve re-executing queries), just skip writing
+			 * the entry.  While regenerating the definition should
+			 * theoretically produce the same result as before, it's expensive
+			 * and feels risky.
+			 *
+			 * The custom format only calls WriteToc() a second time if
+			 * fseeko() is usable (see _CloseArchive() in pg_backup_custom.c),
+			 * so we can safely use it without checking.  For other formats,
+			 * we fail because one of our assumptions must no longer hold
+			 * true.
+			 *
+			 * XXX This is a layering violation, but the alternative is an
+			 * awkward and complicated callback infrastructure for this
+			 * special case.  This might be worth revisiting in the future.
+			 */
+			if (AH->format != archCustom)
+				pg_fatal("unexpected TOC entry in WriteToc(): %d %s %s",
+						 te->dumpId, te->desc, te->tag);
+
+			if (fseeko(AH->FH, te->defnLen, SEEK_CUR != 0))
+				pg_fatal("error during file seek: %m");
+		}
+		else if (te->defnDumper)
+		{
+			char	   *defn = te->defnDumper((Archive *) AH, te->defnDumperArg);
+
+			te->defnLen = WriteStr(AH, defn);
+			pg_free(defn);
+		}
+		else
+			WriteStr(AH, te->defn);
+
 		WriteStr(AH, te->dropStmt);
 		WriteStr(AH, te->copyStmt);
 		WriteStr(AH, te->namespace);
@@ -3697,11 +3738,49 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, const char *pfx)
 	 * versions put into CREATE SCHEMA.  Don't mutate the variant for schema
 	 * "public" that is a comment.  We have to do this when --no-owner mode is
 	 * selected.  This is ugly, but I see no other good way ...
+	 *
+	 * Entries with a defnDumper need to call it to generate the
+	 * definition.  This is primarily intended to provide a way to save memory
+	 * for objects that would otherwise need a lot of it (e.g., statistics
+	 * data).
 	 */
 	if (ropt->noOwner &&
 		strcmp(te->desc, "SCHEMA") == 0 && strncmp(te->defn, "--", 2) != 0)
 	{
 		ahprintf(AH, "CREATE SCHEMA %s;\n\n\n", fmtId(te->tag));
+	}
+	else if (te->defnLen && AH->format != archTar)
+	{
+		/*
+		 * If defnLen is set, the defnDumper has already been called for this
+		 * TOC entry.  We don't normally expect a defnDumper to be called for
+		 * a TOC entry a second time in _printTocEntry(), but there's an
+		 * exception.  The tar format first calls WriteToc(), which scans the
+		 * entire TOC, and then it later calls RestoreArchive() to generate
+		 * restore.sql, which scans the TOC again.  There doesn't appear to be
+		 * a good way to prevent a second defnDumper call in this case without
+		 * storing the definition in memory, which defeats the purpose.  This
+		 * second defnDumper invocation should generate the same output as the
+		 * first, but even if it doesn't, the worst-case scenario is that
+		 * restore.sql might have different statistics data than the archive.
+		 *
+		 * In all other cases, encountering a TOC entry a second time in
+		 * _printTocEntry() is unexpected, so we fail because one of our
+		 * assumptions must no longer hold true.
+		 *
+		 * XXX This is a layering violation, but the alternative is an awkward
+		 * and complicated callback infrastructure for this special case. This
+		 * might be worth revisiting in the future.
+		 */
+		pg_fatal("unexpected TOC entry in _printTocEntry(): %d %s %s",
+				 te->dumpId, te->desc, te->tag);
+	}
+	else if (te->defnDumper)
+	{
+		char	   *defn = te->defnDumper((Archive *) AH, te->defnDumperArg);
+
+		te->defnLen = ahprintf(AH, "%s\n\n", defn);
+		pg_free(defn);
 	}
 	else
 	{
