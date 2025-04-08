@@ -391,13 +391,13 @@ InitProcess(void)
 	MyProc->databaseId = InvalidOid;
 	MyProc->roleId = InvalidOid;
 	MyProc->tempNamespaceId = InvalidOid;
-	MyProc->isBackgroundWorker = IsBackgroundWorker;
+	MyProc->isBackgroundWorker = !AmRegularBackendProcess();
 	MyProc->delayChkptFlags = 0;
 	MyProc->statusFlags = 0;
 	/* NB -- autovac launcher intentionally does not set IS_AUTOVACUUM */
 	if (IsAutoVacuumWorkerProcess())
 		MyProc->statusFlags |= PROC_IS_AUTOVACUUM;
-	MyProc->lwWaiting = false;
+	MyProc->lwWaiting = LW_WS_NOT_WAITING;
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
@@ -576,10 +576,10 @@ InitAuxiliaryProcess(void)
 	MyProc->databaseId = InvalidOid;
 	MyProc->roleId = InvalidOid;
 	MyProc->tempNamespaceId = InvalidOid;
-	MyProc->isBackgroundWorker = IsBackgroundWorker;
+	MyProc->isBackgroundWorker = true;
 	MyProc->delayChkptFlags = 0;
 	MyProc->statusFlags = 0;
-	MyProc->lwWaiting = false;
+	MyProc->lwWaiting = LW_WS_NOT_WAITING;
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
@@ -807,6 +807,10 @@ ProcKill(int code, Datum arg)
 
 	Assert(MyProc != NULL);
 
+	/* not safe if forked by system(), etc. */
+	if (MyProc->pid != (int) getpid())
+		elog(PANIC, "ProcKill() called in child process");
+
 	/* Make sure we're out of the sync rep lists */
 	SyncRepCleanupAtProcExit();
 
@@ -928,6 +932,10 @@ AuxiliaryProcKill(int code, Datum arg)
 	PGPROC	   *proc;
 
 	Assert(proctype >= 0 && proctype < NUM_AUXILIARY_PROCS);
+
+	/* not safe if forked by system(), etc. */
+	if (MyProc->pid != (int) getpid())
+		elog(PANIC, "AuxiliaryProcKill() called in child process");
 
 	auxproc = &AuxiliaryProcs[proctype];
 
@@ -1063,12 +1071,12 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 	/*
 	 * If group locking is in use, locks held by members of my locking group
 	 * need to be included in myHeldLocks.  This is not required for relation
-	 * extension or page locks which conflict among group members. However,
-	 * including them in myHeldLocks will give group members the priority to
-	 * get those locks as compared to other backends which are also trying to
-	 * acquire those locks.  OTOH, we can avoid giving priority to group
-	 * members for that kind of locks, but there doesn't appear to be a clear
-	 * advantage of the same.
+	 * extension lock which conflict among group members. However, including
+	 * them in myHeldLocks will give group members the priority to get those
+	 * locks as compared to other backends which are also trying to acquire
+	 * those locks.  OTOH, we can avoid giving priority to group members for
+	 * that kind of locks, but there doesn't appear to be a clear advantage of
+	 * the same.
 	 */
 	if (leader != NULL)
 	{
