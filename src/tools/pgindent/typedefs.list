@@ -28,6 +28,8 @@ ActiveSnapshotElt
 AddForeignUpdateTargets_function
 AffixNode
 AffixNodeData
+AfterTriggerBatchCallback
+AfterTriggerCallbackItem
 AfterTriggerEvent
 AfterTriggerEventChunk
 AfterTriggerEventData
