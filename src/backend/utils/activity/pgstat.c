@@ -592,7 +592,6 @@ pgstat_report_stat(bool force)
 		!have_slrustats &&
 		!pgstat_have_pending_wal())
 	{
-		Assert(pending_since == 0);
 		return 0;
 	}
 
@@ -1616,6 +1615,16 @@ pgstat_read_statsfile(void)
 
 					header = pgstat_init_entry(key.kind, p);
 					dshash_release_lock(pgStatLocal.shared_hash, p);
+					if (header == NULL)
+					{
+						/*
+						 * It would be tempting to switch this ERROR to a
+						 * WARNING, but it would mean that all the statistics
+						 * are discarded when the environment fails on OOM.
+						 */
+						elog(ERROR,	"could not allocate entry %d/%u/%u",
+							 key.kind, key.dboid, key.objoid);
+					}
 
 					if (!read_chunk(fpin,
 									pgstat_get_entry_data(key.kind, header),

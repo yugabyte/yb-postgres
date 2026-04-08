@@ -3638,6 +3638,13 @@ ApplyWorkerMain(Datum main_arg)
 	StartTransactionCommand();
 	oldctx = MemoryContextSwitchTo(ApplyContext);
 
+	/*
+	 * Lock the subscription to prevent it from being concurrently dropped,
+	 * then re-verify its existence. After the initialization, the worker will
+	 * be terminated gracefully if the subscription is dropped.
+	 */
+	LockSharedObject(SubscriptionRelationId, MyLogicalRepWorker->subid, 0,
+					 AccessShareLock);
 	MySubscription = GetSubscription(MyLogicalRepWorker->subid, true);
 	if (!MySubscription)
 	{
@@ -3794,8 +3801,16 @@ ApplyWorkerMain(Datum main_arg)
 			walrcv_startstreaming(LogRepWorkerWalRcvConn, &options);
 
 			StartTransactionCommand();
+
+			/*
+			 * Updating pg_subscription might involve TOAST table access, so
+			 * ensure we have a valid snapshot.
+			 */
+			PushActiveSnapshot(GetTransactionSnapshot());
+
 			UpdateTwoPhaseState(MySubscription->oid, LOGICALREP_TWOPHASE_STATE_ENABLED);
 			MySubscription->twophasestate = LOGICALREP_TWOPHASE_STATE_ENABLED;
+			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
 		else
@@ -3848,7 +3863,15 @@ DisableSubscriptionAndExit(void)
 
 	/* Disable the subscription */
 	StartTransactionCommand();
+
+	/*
+	 * Updating pg_subscription might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
 	DisableSubscription(MySubscription->oid);
+	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	/* Notify the subscription has been disabled and exit */
@@ -3940,6 +3963,12 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 	}
 
 	/*
+	 * Updating pg_subscription might involve TOAST table access, so ensure we
+	 * have a valid snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/*
 	 * Protect subskiplsn of pg_subscription from being concurrently updated
 	 * while clearing it.
 	 */
@@ -3996,6 +4025,8 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 
 	heap_freetuple(tup);
 	table_close(rel, NoLock);
+
+	PopActiveSnapshot();
 
 	if (started_tx)
 		CommitTransactionCommand();
