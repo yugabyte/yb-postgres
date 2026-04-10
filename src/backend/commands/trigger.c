@@ -3929,7 +3929,10 @@ typedef struct AfterTriggersData
 	AfterTriggersTransData *trans_stack;	/* array of structs shown below */
 	int			maxtransdepth;	/* allocated len of above array */
 
-	List	   *batch_callbacks;	/* List of AfterTriggerCallbackItem */
+	List	   *batch_callbacks;	/* List of AfterTriggerCallbackItem; for
+									 * deferred constraints */
+	bool		firing_batch_callbacks; /* true when in
+										 * FireAfterTriggersBatchCallbacks() */
 } AfterTriggersData;
 
 struct AfterTriggersQueryData
@@ -3937,6 +3940,7 @@ struct AfterTriggersQueryData
 	AfterTriggerEventList events;	/* events pending from this query */
 	Tuplestorestate *fdw_tuplestore;	/* foreign tuples for said events */
 	List	   *tables;			/* list of AfterTriggersTableData, see below */
+	List	   *batch_callbacks;	/* List of AfterTriggerCallbackItem */
 };
 
 struct AfterTriggersTransData
@@ -4025,7 +4029,7 @@ static SetConstraintState SetConstraintStateAddItem(SetConstraintState state,
 													Oid tgoid, bool tgisdeferred);
 static void cancel_prior_stmt_triggers(Oid relid, CmdType cmdType, int tgevent);
 
-static void FireAfterTriggerBatchCallbacks(void);
+static void FireAfterTriggerBatchCallbacks(List *callbacks);
 
 /*
  * Get the FDW tuplestore for the current trigger query level, creating it
@@ -5108,6 +5112,7 @@ AfterTriggerBeginXact(void)
 	afterTriggers.firing_counter = (CommandId) 1;	/* mustn't be 0 */
 	afterTriggers.query_depth = -1;
 	afterTriggers.batch_callbacks = NIL;
+	afterTriggers.firing_batch_callbacks = false;
 
 	/*
 	 * Verify that there is no leftover state remaining.  If these assertions
@@ -5234,11 +5239,9 @@ AfterTriggerEndQuery(EState *estate)
 	/*
 	 * Fire batch callbacks before releasing query-level storage and before
 	 * decrementing query_depth.  Callbacks may do real work (index probes,
-	 * error reporting) and rely on query_depth still reflecting the current
-	 * batch level so that nested calls from SPI inside AFTER triggers are
-	 * correctly suppressed by FireAfterTriggerBatchCallbacks's depth guard.
+	 * error reporting).
 	 */
-	FireAfterTriggerBatchCallbacks();
+	FireAfterTriggerBatchCallbacks(qs->batch_callbacks);
 
 	/* Release query-level-local storage, including tuplestores if any */
 	AfterTriggerFreeQuery(&afterTriggers.query_stack[afterTriggers.query_depth]);
@@ -5309,6 +5312,9 @@ AfterTriggerFreeQuery(AfterTriggersQueryData *qs)
 	 */
 	qs->tables = NIL;
 	list_free_deep(tables);
+
+	list_free_deep(qs->batch_callbacks);
+	qs->batch_callbacks = NIL;
 }
 
 
@@ -5358,13 +5364,14 @@ AfterTriggerFireDeferred(void)
 	}
 
 	/* Flush any fast-path batches accumulated by the triggers just fired. */
-	FireAfterTriggerBatchCallbacks();
+	FireAfterTriggerBatchCallbacks(afterTriggers.batch_callbacks);
 
 	afterTriggerFiringDepth--;
 
 	/*
-	 * We don't bother freeing the event list, since it will go away anyway
-	 * (and more efficiently than via pfree) in AfterTriggerEndXact.
+	 * We don't bother freeing the event list or batch_callbacks, since they
+	 * will go away anyway (and more efficiently than via pfree) in
+	 * AfterTriggerEndXact.
 	 */
 
 	if (snap_pushed)
@@ -5428,6 +5435,10 @@ AfterTriggerEndXact(bool isCommit)
 	afterTriggers.query_depth = -1;
 
 	afterTriggerFiringDepth = 0;
+
+	list_free_deep(afterTriggers.batch_callbacks);
+	afterTriggers.batch_callbacks = NIL;
+	afterTriggers.firing_batch_callbacks = false;
 }
 
 /*
@@ -5574,6 +5585,9 @@ AfterTriggerEndSubXact(bool isCommit)
 			}
 		}
 	}
+
+	/* Reset in case a callback threw an error while firing. */
+	afterTriggers.firing_batch_callbacks = false;
 }
 
 /*
@@ -5710,6 +5724,7 @@ AfterTriggerEnlargeQueryState(void)
 		qs->events.tailfree = NULL;
 		qs->fdw_tuplestore = NULL;
 		qs->tables = NIL;
+		qs->batch_callbacks = NIL;
 
 		++init_depth;
 	}
@@ -6092,8 +6107,10 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		/*
 		 * Flush any fast-path batches accumulated by the triggers just fired.
 		 */
-		FireAfterTriggerBatchCallbacks();
+		FireAfterTriggerBatchCallbacks(afterTriggers.batch_callbacks);
 		afterTriggerFiringDepth--;
+		list_free_deep(afterTriggers.batch_callbacks);
+		afterTriggers.batch_callbacks = NIL;
 
 		if (snapshot_set)
 			PopActiveSnapshot();
@@ -6752,42 +6769,46 @@ RegisterAfterTriggerBatchCallback(AfterTriggerBatchCallback callback,
 	 * outside a trigger-firing context would never fire.
 	 */
 	Assert(afterTriggerFiringDepth > 0);
+	Assert(!afterTriggers.firing_batch_callbacks);
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 	item = palloc(sizeof(AfterTriggerCallbackItem));
 	item->callback = callback;
 	item->arg = arg;
-	afterTriggers.batch_callbacks =
-		lappend(afterTriggers.batch_callbacks, item);
+	if (afterTriggers.query_depth >= 0)
+	{
+		AfterTriggersQueryData *qs =
+			&afterTriggers.query_stack[afterTriggers.query_depth];
+
+		qs->batch_callbacks = lappend(qs->batch_callbacks, item);
+	}
+	else
+		afterTriggers.batch_callbacks =
+			lappend(afterTriggers.batch_callbacks, item);
 	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
  * FireAfterTriggerBatchCallbacks
- *		Invoke and clear all registered batch callbacks.
+ *		Invoke all callbacks in the given list.
  *
- * Only fires at the outermost query level (query_depth == 0) or from
- * top-level operations (query_depth == -1, e.g. AfterTriggerFireDeferred
- * at COMMIT).  Nested queries from SPI inside AFTER triggers run at
- * depth > 0 and must not tear down resources the outer batch still needs.
+ * Memory cleanup of the list and its items is handled by the caller
+ * (AfterTriggerFreeQuery for query-level callbacks, AfterTriggerEndXact
+ * for top-level deferred callbacks).
  */
 static void
-FireAfterTriggerBatchCallbacks(void)
+FireAfterTriggerBatchCallbacks(List *callbacks)
 {
 	ListCell   *lc;
 
-	if (afterTriggers.query_depth > 0)
-		return;
-
 	Assert(afterTriggerFiringDepth > 0);
-	foreach(lc, afterTriggers.batch_callbacks)
+	afterTriggers.firing_batch_callbacks = true;
+	foreach(lc, callbacks)
 	{
 		AfterTriggerCallbackItem *item = lfirst(lc);
 
 		item->callback(item->arg);
 	}
-
-	list_free_deep(afterTriggers.batch_callbacks);
-	afterTriggers.batch_callbacks = NIL;
+	afterTriggers.firing_batch_callbacks = false;
 }
 
 /*
