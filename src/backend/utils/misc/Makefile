@@ -15,6 +15,17 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	pg_yb_utils.o \
+	yb_ash.o \
+	yb_exceptions_for_func_pushdown.o \
+	yb_file_utils.o \
+	yb_index_check.o \
+	yb_jumblefuncs.o \
+	yb_qpm.o \
+	yb_query_diagnostics.o \
+	yb_tcmalloc_utils.o \
+	yb_ysql_conn_mgr_helper.o \
+	\
 	guc.o \
 	help_config.o \
 	pg_config.o \

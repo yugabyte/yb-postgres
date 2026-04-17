@@ -36,6 +36,11 @@
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 
+/* YB includes */
+#include "commands/async.h"
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+
 /*
  * The postmaster's list of registered background workers, in private memory.
  */
@@ -128,6 +133,18 @@ static const struct
 	},
 	{
 		"ApplyWorkerMain", ApplyWorkerMain
+	},
+	{
+		"YbAshMain", YbAshMain
+	},
+	{
+		"YbQueryDiagnosticsMain", YbQueryDiagnosticsMain
+	},
+	{
+		"YbQueryDiagnosticsDatabaseConnectionWorkerMain", YbQueryDiagnosticsDatabaseConnectionWorkerMain
+	},
+	{
+		"YbNotifsPollerMain", YbNotifsPollerMain
 	}
 };
 
@@ -769,6 +786,8 @@ StartBackgroundWorker(void)
 		pqsignal(SIGINT, StatementCancelHandler);
 		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 		pqsignal(SIGFPE, FloatExceptionHandler);
+		pqsignal(SIGSEGV, YbCriticalSignalHandler);
+		pqsignal(SIGABRT, YbCriticalSignalHandler);
 
 		/* XXX Any other handlers needed here? */
 	}
@@ -851,6 +870,8 @@ StartBackgroundWorker(void)
 	 * need to wait until the user code does it via
 	 * BackgroundWorkerInitializeConnection().
 	 */
+
+	MyProc->ybInitializationCompleted = true;
 
 	/*
 	 * Now invoke the user-defined worker code
@@ -1305,4 +1326,10 @@ GetBackgroundWorkerTypeByPid(pid_t pid)
 		return NULL;
 
 	return result;
+}
+
+size_t
+YbBackgroundWorkerHandleSize()
+{
+	return sizeof(BackgroundWorkerHandle);
 }

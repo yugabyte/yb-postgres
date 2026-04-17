@@ -37,6 +37,9 @@
 #include "parser/scansup.h"
 #include "utils/queryjumble.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 #define JUMBLE_SIZE				1024	/* query serialization buffer size */
 
 /* GUC parameters */
@@ -53,6 +56,9 @@ static void JumbleRangeTable(JumbleState *jstate, List *rtable);
 static void JumbleRowMarks(JumbleState *jstate, List *rowMarks);
 static void JumbleExpr(JumbleState *jstate, Node *node);
 static void RecordConstLocation(JumbleState *jstate, int location);
+
+/* YB functions */
+static uint64 yb_compute_backfill_query_id(YbBackfillIndexStmt *stmt);
 
 /*
  * Given a possibly multi-statement source string, confine our attention to the
@@ -106,9 +112,18 @@ JumbleQuery(Query *query, const char *querytext)
 
 	if (query->utilityStmt)
 	{
-		query->queryId = compute_utility_query_id(querytext,
-												  query->stmt_location,
-												  query->stmt_len);
+		if (IsA(query->utilityStmt, YbBackfillIndexStmt))
+		{
+			YbBackfillIndexStmt *bf_stmt =
+				(YbBackfillIndexStmt *) query->utilityStmt;
+			query->queryId = yb_compute_backfill_query_id(bf_stmt);
+		}
+		else
+		{
+			query->queryId = compute_utility_query_id(querytext,
+													  query->stmt_location,
+													  query->stmt_len);
+		}
 	}
 	else
 	{
@@ -866,4 +881,40 @@ RecordConstLocation(JumbleState *jstate, int location)
 		jstate->clocations[jstate->clocations_count].length = -1;
 		jstate->clocations_count++;
 	}
+}
+
+/*
+ * YB: Compute a query identifier for BACKFILL commands such that all calls for the
+ * same index are aggregated under a single queryId.
+ */
+static uint64
+yb_compute_backfill_query_id(YbBackfillIndexStmt *stmt)
+{
+	unsigned char jumble[JUMBLE_SIZE];
+	Size		jumble_len = 0;
+	ListCell   *lc;
+	NodeTag		tag = T_YbBackfillIndexStmt;
+	uint64		queryId;
+
+	memcpy(jumble + jumble_len, &tag, sizeof(tag));
+	jumble_len += sizeof(tag);
+
+	foreach(lc, stmt->oid_list)
+	{
+		Oid			oid = lfirst_oid(lc);
+
+		memcpy(jumble + jumble_len, &oid, sizeof(oid));
+		jumble_len += sizeof(oid);
+	}
+
+	queryId = DatumGetUInt64(hash_any_extended(jumble, jumble_len, 0));
+
+	/*
+	 * If we are unlucky enough to get a hash of zero(invalid), use queryID as
+	 * 2 instead, to be consistent with other utility statements.
+	 */
+	if (queryId == UINT64CONST(0))
+		queryId = UINT64CONST(2);
+
+	return queryId;
 }

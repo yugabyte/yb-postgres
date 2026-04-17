@@ -53,6 +53,10 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "catalog/index.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * Information used to validate the columns in the row filter expression. See
@@ -65,6 +69,9 @@ typedef struct rf_context
 								 * relation's row filter */
 	Oid			relid;			/* relid of the relation */
 	Oid			parentid;		/* relid of the parent relation */
+
+
+	AttrNumber	yb_minattr;		/* YB: offset used to build bms_replident */
 } rf_context;
 
 static List *OpenTableList(List *tables);
@@ -245,7 +252,8 @@ contain_invalid_rfcolumn_walker(Node *node, rf_context *context)
 			attnum = get_attnum(context->relid, colname);
 		}
 
-		if (!bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber,
+		/* YB: use the same offset that was used to build bms_replident */
+		if (!bms_is_member(attnum - context->yb_minattr,
 						   context->bms_replident))
 			return true;
 	}
@@ -315,6 +323,9 @@ pub_rf_contains_invalid_column(Oid pubid, Relation relation, List *ancestors,
 		context.pubviaroot = pubviaroot;
 		context.parentid = publish_as_relid;
 		context.relid = relid;
+
+		if (IsYugaByteEnabled())
+			context.yb_minattr = YBGetFirstLowInvalidAttributeNumber(relation);
 
 		/* Remember columns that are part of the REPLICA IDENTITY */
 		bms = RelationGetIndexAttrBitmap(relation,
@@ -397,11 +408,14 @@ pub_collist_contains_invalid_column(Oid pubid, Relation relation, List *ancestor
 		 * does not use offset, so we can't do bms_is_subset(). Instead, we
 		 * have to loop over the idattrs and check all of them are in the
 		 * list.
+		 *
+		 * YB: Use the same offset that was used to build the bitmap.
 		 */
+		AttrNumber	yb_minattr = YBGetFirstLowInvalidAttributeNumber(relation);
 		x = -1;
 		while ((x = bms_next_member(idattrs, x)) >= 0)
 		{
-			AttrNumber	attnum = (x + FirstLowInvalidHeapAttributeNumber);
+			AttrNumber	attnum = (x + yb_minattr); /* YB */
 
 			/*
 			 * If pubviaroot is true, we are validating the column list of the
@@ -733,6 +747,13 @@ CheckPubRelationColumnList(char *pubname, List *tables,
 ObjectAddress
 CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("CreatePublication is unavailable"),
+				 errdetail("yb_enable_replication_commands is false or a "
+						   "system upgrade is in progress")));
+
 	Relation	rel;
 	ObjectAddress myself;
 	Oid			puboid;
@@ -754,10 +775,11 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 					   get_database_name(MyDatabaseId));
 
 	/* FOR ALL TABLES requires superuser */
-	if (stmt->for_all_tables && !superuser())
+	/* YB: yb_db_admin is allowed to create FOR ALL TABLES */
+	if (stmt->for_all_tables && !superuser() && !IsYbDbAdminUser(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to create FOR ALL TABLES publication")));
+				 errmsg("must be superuser or member of the yb_db_admin role to create FOR ALL TABLES publication")));
 
 	rel = table_open(PublicationRelationId, RowExclusiveLock);
 
@@ -783,6 +805,15 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  &publish_given, &pubactions,
 							  &publish_via_partition_root_given,
 							  &publish_via_partition_root);
+
+	if (IsYugaByteEnabled() && !(pubactions.pubinsert && pubactions.pubupdate &&
+								 pubactions.pubdelete &&
+								 pubactions.pubtruncate))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("publishing only a subset of DML commands is not yet supported"),
+				 errhint("See https://github.com/yugabyte/yugabyte-db/issues/"
+						 "19250. React with thumbs up to raise its priority.")));
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -825,10 +856,10 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 								   &schemaidlist);
 
 		/* FOR TABLES IN SCHEMA requires superuser */
-		if (schemaidlist != NIL && !superuser())
+		if (schemaidlist != NIL && !superuser() && !IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					errmsg("must be superuser to create FOR TABLES IN SCHEMA publication"));
+					errmsg("must be superuser or member of the yb_db_admin role to create FOR TABLES IN SCHEMA publication"));
 
 		if (list_length(relations) > 0)
 		{
@@ -856,6 +887,10 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 			PublicationAddSchemas(puboid, schemaidlist, true, NULL);
 		}
 	}
+
+	/* YB: Log a NOTICE for unsupported relations. */
+	if (IsYugaByteEnabled() && stmt->for_all_tables)
+		yb_log_unsupported_publication_relations();
 
 	table_close(rel, RowExclusiveLock);
 
@@ -976,6 +1011,15 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							   relname, "publish_via_partition_root")));
 		}
 	}
+
+	if (IsYugaByteEnabled() && !(pubactions.pubinsert && pubactions.pubupdate &&
+								 pubactions.pubdelete &&
+								 pubactions.pubtruncate))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("publishing only a subset of DML commands is not yet supported"),
+				 errhint("See https://github.com/yugabyte/yugabyte-db/issues/"
+						 "19250. React with thumbs up to raise its priority.")));
 
 	/* Everything ok, form a new tuple. */
 	memset(values, 0, sizeof(values));
@@ -1342,10 +1386,10 @@ CheckAlterPublication(AlterPublicationStmt *stmt, HeapTuple tup,
 	Form_pg_publication pubform = (Form_pg_publication) GETSTRUCT(tup);
 
 	if ((stmt->action == AP_AddObjects || stmt->action == AP_SetObjects) &&
-		schemaidlist && !superuser())
+		schemaidlist && !superuser() && !IsYbDbAdminUser(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to add or set schemas")));
+				 errmsg("must be superuser or member of the yb_db_admin role to add or set schemas")));
 
 	/*
 	 * Check that user is allowed to manipulate the publication tables in
@@ -1376,6 +1420,12 @@ CheckAlterPublication(AlterPublicationStmt *stmt, HeapTuple tup,
 void
 AlterPublication(ParseState *pstate, AlterPublicationStmt *stmt)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("AlterPublication is unavailable"),
+						errdetail("yb_enable_replication_commands is false or a"
+								  " system upgrade is in progress")));
+
 	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_publication pubform;
@@ -1446,6 +1496,12 @@ AlterPublication(ParseState *pstate, AlterPublicationStmt *stmt)
 void
 RemovePublicationRelById(Oid proid)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("RemovePublicationRelById is unavailable"),
+						errdetail("yb_enable_replication_commands is false or a"
+								  " system upgrade is in progress")));
+
 	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_publication_rel pubrel;
@@ -1474,7 +1530,7 @@ RemovePublicationRelById(Oid proid)
 
 	InvalidatePublicationRels(relids);
 
-	CatalogTupleDelete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, tup);
 
 	ReleaseSysCache(tup);
 
@@ -1487,6 +1543,12 @@ RemovePublicationRelById(Oid proid)
 void
 RemovePublicationById(Oid pubid)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("RemovePublicationById is unavailable"),
+						errdetail("yb_enable_replication_commands is false or a"
+								  " system upgrade is in progress")));
+
 	Relation	rel;
 	HeapTuple	tup;
 	Form_pg_publication pubform;
@@ -1503,7 +1565,7 @@ RemovePublicationById(Oid pubid)
 	if (pubform->puballtables)
 		CacheInvalidateRelcacheAll();
 
-	CatalogTupleDelete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, tup);
 
 	ReleaseSysCache(tup);
 
@@ -1539,7 +1601,7 @@ RemovePublicationSchemaById(Oid psoid)
 											   PUBLICATION_PART_ALL);
 	InvalidatePublicationRels(schemaRels);
 
-	CatalogTupleDelete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, tup);
 
 	ReleaseSysCache(tup);
 
@@ -1900,7 +1962,7 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 	if (form->pubowner == newOwnerId)
 		return;
 
-	if (!superuser())
+	if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 	{
 		AclResult	aclresult;
 
@@ -1918,19 +1980,19 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 			aclcheck_error(aclresult, OBJECT_DATABASE,
 						   get_database_name(MyDatabaseId));
 
-		if (form->puballtables && !superuser_arg(newOwnerId))
+		if (form->puballtables && !superuser_arg(newOwnerId) && !IsYbDbAdminUser(newOwnerId))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to change owner of publication \"%s\"",
 							NameStr(form->pubname)),
-					 errhint("The owner of a FOR ALL TABLES publication must be a superuser.")));
+					 errhint("The owner of a FOR ALL TABLES publication must be a superuser or member of the yb_db_admin role.")));
 
-		if (!superuser_arg(newOwnerId) && is_schema_publication(form->oid))
+		if (!superuser_arg(newOwnerId) && !IsYbDbAdminUser(newOwnerId) && is_schema_publication(form->oid))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to change owner of publication \"%s\"",
 							NameStr(form->pubname)),
-					 errhint("The owner of a FOR TABLES IN SCHEMA publication must be a superuser.")));
+					 errhint("The owner of a FOR TABLES IN SCHEMA publication must be a superuser or member of the yb_db_admin role.")));
 	}
 
 	form->pubowner = newOwnerId;
@@ -1951,6 +2013,12 @@ AlterPublicationOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 ObjectAddress
 AlterPublicationOwner(const char *name, Oid newOwnerId)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("AlterPublicationOwner is unavailable"),
+						errdetail("yb_enable_replication_commands is false or a"
+								  " system upgrade is in progress")));
+
 	Oid			subid;
 	HeapTuple	tup;
 	Relation	rel;
@@ -1986,6 +2054,12 @@ AlterPublicationOwner(const char *name, Oid newOwnerId)
 void
 AlterPublicationOwner_oid(Oid subid, Oid newOwnerId)
 {
+	if (IsYugaByteEnabled() && !yb_enable_replication_commands)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("AlterPublicationOwner_oid is unavailable"),
+						errdetail("yb_enable_replication_commands is false or a"
+								  " system upgrade is in progress")));
+
 	HeapTuple	tup;
 	Relation	rel;
 
