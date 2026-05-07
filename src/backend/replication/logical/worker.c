@@ -3757,7 +3757,8 @@ apply_handle_truncate(StringInfo s)
 						relids_logged,
 						DROP_RESTRICT,
 						restart_seqs,
-						!MySubscription->runasowner);
+						!MySubscription->runasowner,
+						false /* yb_is_top_level */ );
 	foreach(lc, remote_rels)
 	{
 		LogicalRepRelMapEntry *rel = lfirst(lc);

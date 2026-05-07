@@ -881,6 +881,18 @@ fail:
 }
 
 /*
+ * YB: This function is a wrapper around ProcessStartupPacket, lifting it from
+ * `static` to `extern` as it is required in postgres.c for the Authentication
+ * Passthrough mode of Connection Manager, while making minimal changes to
+ * upstream-owned code.
+ */
+int
+YbProcessStartupPacket(Port *port, bool ssl_done, bool gss_done)
+{
+	return ProcessStartupPacket(port, ssl_done, gss_done);
+}
+
+/*
  * The client has sent a cancel request packet, not a normal
  * start-a-new-connection packet.  Perform the necessary processing.  Nothing
  * is sent back to the client.

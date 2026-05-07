@@ -55,6 +55,11 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/resowner_private.h"
+#include "utils/yb_inheritscache.h"
+
 /*
  * ResourceElem represents a reference associated with a resource owner.
  *
@@ -209,6 +214,7 @@ static void ResourceOwnerReleaseInternal(ResourceOwner owner,
 										 bool isCommit,
 										 bool isTopLevel);
 static void ReleaseAuxProcessResourcesCallback(int code, Datum arg);
+
 
 
 /*****************************************************************************
@@ -669,6 +675,13 @@ ResourceOwnerRelease(ResourceOwner owner,
 		nhash_lookups = 0;
 	}
 #endif
+
+	/* YB Note: Assert that local lock table is empty on txn finish */
+#ifdef USE_ASSERT_CHECKING
+	if (isTopLevel && phase == RESOURCE_RELEASE_LOCKS &&
+		YBGetObjectLockMode() == YB_OBJECT_LOCK_ENABLED)
+		Assert(YbGetNumTxnLocks() == 0);
+#endif
 }
 
 static void
@@ -739,6 +752,13 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 
 			pgaio_io_release_resowner(node, !isCommit);
 		}
+
+		/*
+		 * YB_TODO_PG19MERGE: re-port the YbPgInheritsCache leak loop via a
+		 * dedicated ResourceOwnerDesc registered in yb_inheritscache.c
+		 * (mirror catcache_resowner_desc); release happens automatically in
+		 * ResourceOwnerReleaseAll above once the desc is registered.
+		 */
 	}
 	else if (phase == RESOURCE_RELEASE_LOCKS)
 	{
@@ -1107,4 +1127,28 @@ void
 ResourceOwnerForgetAioHandle(ResourceOwner owner, struct dlist_node *ioh_node)
 {
 	dlist_delete_from(&owner->aio_handles, ioh_node);
+}
+
+/*
+ * YB_TODO_PG19MERGE: stubbed for build only. Port to the new ResourceOwnerDesc
+ * design. Also clean up src/include/utils/resowner_private.h.
+ */
+void
+ResourceOwnerEnlargeYbPgInheritsRefs(ResourceOwner owner)
+{
+	/* no-op stub */
+}
+
+void
+ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
+									 YbPgInheritsCacheEntry entry)
+{
+	/* no-op stub */
+}
+
+void
+ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
+								   YbPgInheritsCacheEntry entry)
+{
+	/* no-op stub */
 }

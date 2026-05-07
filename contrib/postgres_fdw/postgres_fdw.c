@@ -53,6 +53,16 @@
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
 
+/* YB includes */
+#include "catalog/pg_authid.h"
+#include "commands/dbcommands.h"
+#include "pg_yb_utils.h"
+#include "utils/acl.h"
+#include "yb/yql/pggate/util/ybc_pgresult_util.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+#include "ybctid.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "postgres_fdw",
 					.version = PG_VERSION
@@ -66,6 +76,16 @@ PG_MODULE_MAGIC_EXT(
 
 /* If no remote estimates, assume a sort costs 20% extra */
 #define DEFAULT_FDW_SORT_MULTIPLIER 1.2
+
+/* YB: If no server_type is provided, assume that the underlying server is Postgres */
+#define YB_DEFAULT_FDW_SERVER_TYPE	PG_FDW_SERVER_POSTGRES
+
+const char *yb_server_types[] = {
+	[PG_FDW_SERVER_UNKNOWN] = "unknown",
+	[PG_FDW_SERVER_POSTGRES] = "postgreSQL",
+	[PG_FDW_SERVER_YUGABYTEDB] = "yugabyteDB",
+	[PG_FDW_SERVER_FEDERATED_YUGABYTEDB] = "federatedYugabyteDB"
+};
 
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
@@ -178,6 +198,9 @@ typedef struct PgFdwScanState
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
 
 	int			fetch_size;		/* number of tuples per fetch */
+
+	/* YB state: opaque handle to PgGlobalViewRead for federatedYugabyteDB scans */
+	YbcPgGlobalViewRead yb_gvr;
 } PgFdwScanState;
 
 /*
@@ -216,6 +239,9 @@ typedef struct PgFdwModifyState
 	/* for update row movement if subplan result rel */
 	struct PgFdwModifyState *aux_fmstate;	/* foreign-insert state, if
 											 * created */
+
+	/* YB state */
+	YbPgFdwServerType yb_server_type;	/* type of server hosting the relation */
 } PgFdwModifyState;
 
 /*
@@ -252,6 +278,9 @@ typedef struct PgFdwDirectModifyState
 
 	/* working memory context */
 	MemoryContext temp_cxt;		/* context for per-tuple temporary data */
+
+	/* YB state */
+	YbPgFdwServerType yb_server_type;	/* type of server hosting the relation */
 } PgFdwDirectModifyState;
 
 /*
@@ -657,7 +686,8 @@ static void prepare_foreign_modify(PgFdwModifyState *fmstate);
 static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
 											 ItemPointer tupleid,
 											 TupleTableSlot **slots,
-											 int numSlots);
+											 int numSlots,
+											 bytea *ybctid);
 static void store_returning_result(PgFdwModifyState *fmstate,
 								   TupleTableSlot *slot, PGresult *res);
 static void finish_foreign_modify(PgFdwModifyState *fmstate);
@@ -759,6 +789,13 @@ static void merge_fdw_options(PgFdwRelationInfo *fpinfo,
 							  const PgFdwRelationInfo *fpinfo_o,
 							  const PgFdwRelationInfo *fpinfo_i);
 static int	get_batch_size_option(Relation rel);
+
+static const char *yb_server_type_to_string(YbPgFdwServerType server_type);
+static YbPgFdwServerType yb_get_server_type(const char *server_type);
+static YbPgFdwServerType yb_get_server_type_from_ftrelid(Oid relid);
+static const char *yb_get_tuple_identifier_colname(YbPgFdwServerType server_type);
+static AttrNumber yb_get_min_attr_from_server_type(YbPgFdwServerType server_type);
+static PGresult *YbGlobalViewReadExecScan(YbcPgGlobalViewRead yb_gvr, const char *query);
 
 
 /*
@@ -905,14 +942,14 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * columns used in them.  Doesn't seem worth detecting that case though.)
 	 */
 	fpinfo->attrs_used = NULL;
-	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid,
-				   &fpinfo->attrs_used);
+	pull_varattnos_min_attr((Node *) baserel->reltarget->exprs, baserel->relid,
+							&fpinfo->attrs_used, fpinfo->yb_min_attr + 1);
 	foreach(lc, fpinfo->local_conds)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		pull_varattnos((Node *) rinfo->clause, baserel->relid,
-					   &fpinfo->attrs_used);
+		pull_varattnos_min_attr((Node *) rinfo->clause, baserel->relid,
+								&fpinfo->attrs_used, fpinfo->yb_min_attr + 1);
 	}
 
 	/*
@@ -1260,8 +1297,12 @@ postgresGetForeignPaths(PlannerInfo *root,
 								   NIL);	/* no fdw_private list */
 	add_path(baserel, (Path *) path);
 
-	/* Add paths with pathkeys */
-	add_paths_with_pathkeys_for_rel(root, baserel, NULL, NIL);
+	/*
+	 * Add paths with pathkeys.
+	 * YB: Do not push down ORDER BY for federated server (global views).
+	 */
+	if (fpinfo->yb_server_type != PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
+		add_paths_with_pathkeys_for_rel(root, baserel, NULL, NIL);
 
 	/*
 	 * If we're not using remote estimates, stop here.  We have no way to
@@ -1746,19 +1787,65 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 		rtindex = bms_next_member(fsplan->fs_base_relids, -1);
 	rte = exec_rt_fetch(rtindex, estate);
 
+	YbPgFdwServerType yb_server_type = yb_get_server_type_from_ftrelid(rte->relid);
+
+	if (yb_server_type == PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
+	{
+		if (!yb_enable_global_views)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("federatedYB queries are not supported"),
+					 errhint("Must enable the GUC yb_enable_global_views")));
+
+		if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for federated YugabyteDB query"),
+					 errhint("Must be a member of the pg_read_all_stats role.")));
+	}
+
 	/* Get info about foreign table. */
 	table = GetForeignTable(rte->relid);
-	user = GetUserMapping(userid, table->serverid);
 
 	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
+	 * YB: For federatedYugabyteDB server types, the query is passed to the remote
+	 * tservers through RPCs. The remote tserver uses a unix socket connection to
+	 * execute the query.
 	 */
-	fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
+	if (yb_server_type != PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
+	{
+		user = GetUserMapping(userid, table->serverid);
+		/*
+		 * Get connection to the foreign server.  Connection manager will
+		 * establish new connection if necessary.
+		 */
+		fsstate->conn = GetConnection(user, false, &fsstate->conn_state);
 
-	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+		/*
+		 * Assign a unique ID for my cursor
+		 * YB: Retrieval is capped at the rpc_max_message_size per tserver.
+		 * If this limit is exceeded, excess data is truncated, and a warning
+		 * is logged here.
+		 */
+		fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	}
+
+	/*
+	 * YB: For federatedYB tables (yb_gvr path), no SQL cursor is used.
+	 * Instead, create_cursor sets cursor_exists = true after binding
+	 * parameters via YBCPgGlobalViewReadSetParams.
+	 *
+	 * postgresIterateForeignScan checks this flag and calls create_cursor on
+	 * the first iterate when it is false.  Without this guard, create_cursor
+	 * would be called on every iterate, redundantly re-binding parameters.
+	 * postgresReScanForeignScan resets it to false for yb_gvr scans (which
+	 * cannot be rewound), so that the next iterate re-initializes the scan
+	 * with fresh parameters.  postgresEndForeignScan skips the close_cursor
+	 * call for yb_gvr scans entirely, destroying the YBCPg handle directly
+	 * instead.
+	 */
 	fsstate->cursor_exists = false;
+	fsstate->yb_gvr = NULL;
 
 	/* Get private info created by planner functions. */
 	fsstate->query = strVal(list_nth(fsplan->fdw_private,
@@ -1767,6 +1854,11 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 												 FdwScanPrivateRetrievedAttrs);
 	fsstate->fetch_size = intVal(list_nth(fsplan->fdw_private,
 										  FdwScanPrivateFetchSize));
+
+	/* YB: Create and initialize the global view scan. */
+	if (yb_server_type == PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
+		HandleYBStatus(YBCPgNewGlobalViewRead(get_database_name(MyDatabaseId),
+			&fsstate->yb_gvr));
 
 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
 	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
@@ -1857,6 +1949,22 @@ postgresIterateForeignScan(ForeignScanState *node)
 }
 
 /*
+ * YbResetForeignScanControlState
+ *		Reset the tuple-fetching control state so the next iteration
+ *		starts fresh.  Used by both ReScan and the cursor-rewind paths.
+ */
+static void
+YbResetForeignScanControlState(PgFdwScanState *fsstate)
+{
+	/* Now force a fresh FETCH. */
+	fsstate->tuples = NULL;
+	fsstate->num_tuples = 0;
+	fsstate->next_tuple = 0;
+	fsstate->fetch_ct_2 = 0;
+	fsstate->eof_reached = false;
+}
+
+/*
  * postgresReScanForeignScan
  *		Restart the scan.
  */
@@ -1870,6 +1978,18 @@ postgresReScanForeignScan(ForeignScanState *node)
 	/* If we haven't created the cursor yet, nothing to do. */
 	if (!fsstate->cursor_exists)
 		return;
+
+	if (fsstate->yb_gvr)
+	{
+		YBCPgGlobalViewReadResetScan(fsstate->yb_gvr);
+		YbResetForeignScanControlState(fsstate);
+		/*
+		 * YB: yb_gvr scans cannot be rewound, so force create_cursor on the
+		 * next iterate to re-evaluate parameters.
+		 */
+		fsstate->cursor_exists = false;
+		return;
+	}
 
 	/*
 	 * If the node is async-capable, and an asynchronous fetch for it has
@@ -1922,12 +2042,7 @@ postgresReScanForeignScan(ForeignScanState *node)
 		pgfdw_report_error(res, fsstate->conn, sql);
 	PQclear(res);
 
-	/* Now force a fresh FETCH. */
-	fsstate->tuples = NULL;
-	fsstate->num_tuples = 0;
-	fsstate->next_tuple = 0;
-	fsstate->fetch_ct_2 = 0;
-	fsstate->eof_reached = false;
+	YbResetForeignScanControlState(fsstate);
 }
 
 /*
@@ -1942,6 +2057,13 @@ postgresEndForeignScan(ForeignScanState *node)
 	/* if fsstate is NULL, we are in EXPLAIN; nothing to do */
 	if (fsstate == NULL)
 		return;
+
+	if (fsstate->yb_gvr)
+	{
+		YBCPgGlobalViewReadDestroy(fsstate->yb_gvr);
+		fsstate->yb_gvr = NULL;
+		return;
+	}
 
 	/* Close the cursor if open, to prevent accumulation of cursors */
 	if (fsstate->cursor_exists)
@@ -1966,6 +2088,23 @@ postgresAddForeignUpdateTargets(PlannerInfo *root,
 								Relation target_relation)
 {
 	Var		   *var;
+
+	/*
+	 * In YugabyteDB, we need the ybctid to identify the tuple undergoing update/delete.
+	 */
+	if (yb_get_server_type_from_ftrelid(RelationGetRelid(target_relation)) ==
+		PG_FDW_SERVER_YUGABYTEDB)
+	{
+		var = makeVar(rtindex,
+					  YBTupleIdAttributeNumber,
+					  BYTEAOID,
+					  -1,
+					  InvalidOid,
+					  0);
+
+		add_row_identity_var(root, var, rtindex, "ybctid");
+		return;
+	}
 
 	/*
 	 * In postgres_fdw, what we need is the ctid, same as for a regular table.
@@ -2003,6 +2142,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 	List	   *retrieved_attrs = NIL;
 	bool		doNothing = false;
 	int			values_end_len = -1;
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(rte->relid);
 
 	initStringInfo(&sql);
 
@@ -2049,7 +2189,7 @@ postgresPlanForeignModify(PlannerInfo *root,
 		while ((col = bms_next_member(allUpdatedCols, col)) >= 0)
 		{
 			/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
-			AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+			AttrNumber	attno = col + yb_min_attr;
 
 			if (attno <= InvalidAttrNumber) /* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
@@ -2796,13 +2936,15 @@ postgresPlanDirectModify(PlannerInfo *root,
 								   processed_tlist,
 								   targetAttrs,
 								   remote_exprs, &params_list,
-								   returningList, &retrieved_attrs);
+								   returningList,
+								   &retrieved_attrs);
 			break;
 		case CMD_DELETE:
 			deparseDirectDeleteSql(&sql, root, resultRelation, rel,
 								   foreignrel,
 								   remote_exprs, &params_list,
-								   returningList, &retrieved_attrs);
+								   returningList,
+								   &retrieved_attrs);
 			break;
 		default:
 			elog(ERROR, "unexpected operation: %d", (int) operation);
@@ -2895,6 +3037,9 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
 		dmstate->rel = node->ss.ss_currentRelation;
 	table = GetForeignTable(RelationGetRelid(dmstate->rel));
 	user = GetUserMapping(userid, table->serverid);
+
+	/* YB: Save server type of relation for future reference */
+	dmstate->yb_server_type = yb_get_server_type_from_ftrelid(RelationGetRelid(dmstate->rel));
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -3948,7 +4093,7 @@ create_cursor(ForeignScanState *node)
 	PGresult   *res;
 
 	/* First, process a pending asynchronous request, if any. */
-	if (fsstate->conn_state->pendingAreq)
+	if (!fsstate->yb_gvr && fsstate->conn_state->pendingAreq)
 		process_pending_request(fsstate->conn_state->pendingAreq);
 
 	/*
@@ -3968,6 +4113,14 @@ create_cursor(ForeignScanState *node)
 							 values);
 
 		MemoryContextSwitchTo(oldcontext);
+	}
+
+	if (fsstate->yb_gvr)
+	{
+		if (numParams > 0)
+			YBCPgGlobalViewReadSetParams(fsstate->yb_gvr, numParams, values);
+		fsstate->cursor_exists = true;
+		return;
 	}
 
 	/* Construct the DECLARE CURSOR command */
@@ -4043,6 +4196,13 @@ fetch_more_data(ForeignScanState *node)
 		/* Reset per-connection state */
 		fsstate->conn_state->pendingAreq = NULL;
 	}
+	else if (fsstate->yb_gvr)
+	{
+		res = YbGlobalViewReadExecScan(fsstate->yb_gvr, fsstate->query);
+		/* On error, report the original query, not the FETCH. */
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(res, conn, fsstate->query);
+	}
 	else
 	{
 		char		sql[64];
@@ -4081,7 +4241,10 @@ fetch_more_data(ForeignScanState *node)
 		fsstate->fetch_ct_2++;
 
 	/* Must be EOF if we didn't get as many tuples as we asked for. */
-	fsstate->eof_reached = (numrows < fsstate->fetch_size);
+	if (fsstate->yb_gvr)
+		fsstate->eof_reached = YBCPgGlobalViewReadIsEof(fsstate->yb_gvr);
+	else
+		fsstate->eof_reached = (numrows < fsstate->fetch_size);
 
 	PQclear(res);
 
@@ -4218,6 +4381,9 @@ create_foreign_modify(EState *estate,
 	fmstate->has_returning = has_returning;
 	fmstate->retrieved_attrs = retrieved_attrs;
 
+	/* YB: Save server type of relation for future reference */
+	fmstate->yb_server_type = yb_get_server_type_from_ftrelid(RelationGetRelid(rel));
+
 	/* Create context for per-tuple temp workspace. */
 	fmstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
 											  "postgres_fdw temporary data",
@@ -4235,15 +4401,19 @@ create_foreign_modify(EState *estate,
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
 		Assert(subplan != NULL);
+		const char *yb_tupleid_colname = yb_get_tuple_identifier_colname(fmstate->yb_server_type);
 
 		/* Find the ctid resjunk column in the subplan's result */
 		fmstate->ctidAttno = ExecFindJunkAttributeInTlist(subplan->targetlist,
-														  "ctid");
+														  yb_tupleid_colname);
 		if (!AttributeNumberIsValid(fmstate->ctidAttno))
-			elog(ERROR, "could not find junk ctid column");
+			elog(ERROR, "could not find junk %s column", yb_tupleid_colname);
 
 		/* First transmittable parameter will be ctid */
-		getTypeOutputInfo(TIDOID, &typefnoid, &isvarlena);
+		if (fmstate->yb_server_type == PG_FDW_SERVER_YUGABYTEDB)
+			getTypeOutputInfo(BYTEAOID, &typefnoid, &isvarlena);
+		else
+			getTypeOutputInfo(TIDOID, &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
 		fmstate->p_nums++;
 	}
@@ -4302,6 +4472,7 @@ execute_foreign_modify(EState *estate,
 	PGresult   *res;
 	int			n_rows;
 	StringInfoData sql;
+	bytea	   *ybctid = NULL;
 
 	/* The operation should be INSERT, UPDATE, or DELETE */
 	Assert(operation == CMD_INSERT ||
@@ -4350,12 +4521,16 @@ execute_foreign_modify(EState *estate,
 									 &isNull);
 		/* shouldn't ever get a null result... */
 		if (isNull)
-			elog(ERROR, "ctid is NULL");
-		ctid = (ItemPointer) DatumGetPointer(datum);
+			elog(ERROR, "%s is NULL", yb_get_tuple_identifier_colname(fmstate->yb_server_type));
+
+		if (fmstate->yb_server_type == PG_FDW_SERVER_YUGABYTEDB)
+			ybctid = DatumGetByteaP(datum);
+		else
+			ctid = (ItemPointer) DatumGetPointer(datum);
 	}
 
 	/* Convert parameters needed by prepared statement to text form */
-	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots);
+	p_values = convert_prep_stmt_params(fmstate, ctid, slots, *numSlots, ybctid);
 
 	/*
 	 * Execute the prepared statement.
@@ -4453,6 +4628,8 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
  *		Create array of text strings representing parameter values
  *
  * tupleid is ctid to send, or NULL if none
+ * YB: ybctid is the tuple identifier for YugabyteDB server types.
+ * YB: At most one of tupleid or ybctid is non-NULL.
  * slot is slot to get remaining parameters from, or NULL if none
  *
  * Data is constructed in temp_cxt; caller should reset that after use.
@@ -4461,7 +4638,8 @@ static const char **
 convert_prep_stmt_params(PgFdwModifyState *fmstate,
 						 ItemPointer tupleid,
 						 TupleTableSlot **slots,
-						 int numSlots)
+						 int numSlots,
+						 bytea *ybctid)
 {
 	const char **p_values;
 	int			i;
@@ -4474,7 +4652,7 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 	p_values = (const char **) palloc(sizeof(char *) * fmstate->p_nums * numSlots);
 
 	/* ctid is provided only for UPDATE/DELETE, which don't allow batching */
-	Assert(!(tupleid != NULL && numSlots > 1));
+	Assert(!(tupleid != NULL && ybctid && numSlots > 1));
 
 	/* 1st parameter should be ctid, if it's in use */
 	if (tupleid != NULL)
@@ -4483,6 +4661,13 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 		/* don't need set_transmission_modes for TID output */
 		p_values[pindex] = OutputFunctionCall(&fmstate->p_flinfo[pindex],
 											  PointerGetDatum(tupleid));
+		pindex++;
+	}
+	else if (ybctid)
+	{
+		Assert(numSlots == 1);
+		p_values[pindex] = OutputFunctionCall(&fmstate->p_flinfo[pindex],
+											  PointerGetDatum(ybctid));
 		pindex++;
 	}
 
@@ -4497,7 +4682,7 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
 
 		for (i = 0; i < numSlots; i++)
 		{
-			j = (tupleid != NULL) ? 1 : 0;
+			j = (tupleid != NULL || ybctid) ? 1 : 0;
 			foreach(lc, fmstate->target_attrs)
 			{
 				int			attnum = lfirst_int(lc);
@@ -4670,7 +4855,8 @@ build_remote_returning(Index rtindex, Relation rel, List *returningList)
 		if (IsA(var, Var) &&
 			var->varno == rtindex &&
 			var->varattno <= InvalidAttrNumber &&
-			var->varattno != SelfItemPointerAttributeNumber)
+			var->varattno != SelfItemPointerAttributeNumber &&
+			var->varattno != YBTupleIdAttributeNumber)
 			continue;			/* don't need it */
 
 		if (tlist_member((Expr *) var, tlist))
@@ -4890,9 +5076,11 @@ init_returning_filter(PgFdwDirectModifyState *dmstate,
 			if (attrno < 0)
 			{
 				/*
-				 * We don't retrieve system columns other than ctid and oid.
+				 * We don't retrieve system columns other than ctid, ybctid and oid.
 				 */
 				if (attrno == SelfItemPointerAttributeNumber)
+					dmstate->ctidAttno = i;
+				else if (attrno == YBTupleIdAttributeNumber)
 					dmstate->ctidAttno = i;
 				else
 					Assert(false);
@@ -4985,10 +5173,20 @@ apply_returning_filter(PgFdwDirectModifyState *dmstate,
 		/* ctid */
 		if (dmstate->ctidAttno)
 		{
-			ItemPointer ctid = NULL;
+			if (dmstate->yb_server_type == PG_FDW_SERVER_YUGABYTEDB)
+			{
+				/* YugabyteDB */
+				bytea	   *ybctid = DatumGetByteaP(old_values[dmstate->ctidAttno - 1]);
 
-			ctid = (ItemPointer) DatumGetPointer(old_values[dmstate->ctidAttno - 1]);
-			resultTup->t_self = *ctid;
+				COPY_YBCTID(PointerGetDatum(ybctid), HEAPTUPLE_YBCTID(resultTup));
+			}
+			else
+			{
+				ItemPointer ctid = NULL;
+
+				ctid = (ItemPointer) DatumGetPointer(old_values[dmstate->ctidAttno - 1]);
+				resultTup->t_self = *ctid;
+			}
 		}
 
 		/*
@@ -6671,6 +6869,13 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		return false;
 
 	/*
+	 * YB: Do not push down joins for global views scans (federated server).
+	 */
+	if (fpinfo_o->yb_server_type == PG_FDW_SERVER_FEDERATED_YUGABYTEDB ||
+		fpinfo_i->yb_server_type == PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
+		return false;
+
+	/*
 	 * Merge FDW options.  We might be tempted to do this after we have deemed
 	 * the foreign join to be OK.  But we must do this beforehand so that we
 	 * know which quals can be evaluated on the foreign server, which might
@@ -7092,7 +7297,15 @@ apply_server_options(PgFdwRelationInfo *fpinfo)
 			(void) parse_int(defGetString(def), &fpinfo->fetch_size, 0, NULL);
 		else if (strcmp(def->defname, "async_capable") == 0)
 			fpinfo->async_capable = defGetBoolean(def);
+		/* YB-specific server options */
+		else if (strcmp(def->defname, "server_type") == 0)
+		{
+			fpinfo->yb_server_type = yb_get_server_type(defGetString(def));
+			Assert(fpinfo->yb_server_type != PG_FDW_SERVER_UNKNOWN);
+		}
 	}
+
+	fpinfo->yb_min_attr = yb_get_min_attr_from_server_type(fpinfo->yb_server_type);
 }
 
 /*
@@ -7150,6 +7363,8 @@ merge_fdw_options(PgFdwRelationInfo *fpinfo,
 	fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate;
 	fpinfo->fetch_size = fpinfo_o->fetch_size;
 	fpinfo->async_capable = fpinfo_o->async_capable;
+	fpinfo->yb_server_type = fpinfo_o->yb_server_type;
+	fpinfo->yb_min_attr = fpinfo_o->yb_min_attr;
 
 	/* Merge the table level options from either side of the join. */
 	if (fpinfo_i)
@@ -7181,6 +7396,13 @@ merge_fdw_options(PgFdwRelationInfo *fpinfo,
 		 */
 		fpinfo->async_capable = fpinfo_o->async_capable ||
 			fpinfo_i->async_capable;
+
+		if (fpinfo_i->yb_server_type != fpinfo_o->yb_server_type)
+			elog(ERROR, "Mismatched server_type of relations: %s(%s), %s(%s)",
+				 fpinfo_o->relation_name,
+				 yb_server_type_to_string(fpinfo_o->yb_server_type),
+				 fpinfo_i->relation_name,
+				 yb_server_type_to_string(fpinfo_i->yb_server_type));
 	}
 }
 
@@ -7586,6 +7808,14 @@ postgresGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	 */
 	if (!input_rel->fdw_private ||
 		!((PgFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
+		return;
+
+	/*
+	 * YB: Do not push down GROUP BY, ORDER BY, or LIMIT for federated server
+	 * (global views). Only WHERE clauses should be pushed down.
+	 */
+	if (((PgFdwRelationInfo *) input_rel->fdw_private)->yb_server_type ==
+		PG_FDW_SERVER_FEDERATED_YUGABYTEDB)
 		return;
 
 	/* Ignore stages we don't support; and skip any duplicate calls. */
@@ -8435,6 +8665,7 @@ make_tuple_from_result_row(PGresult *res,
 	MemoryContext oldcontext;
 	ListCell   *lc;
 	int			j;
+	bytea	   *ybctid = NULL;
 
 	Assert(row < PQntuples(res));
 
@@ -8516,8 +8747,18 @@ make_tuple_from_result_row(PGresult *res,
 				ctid = (ItemPointer) DatumGetPointer(datum);
 			}
 		}
-		errpos.cur_attno = 0;
+		else if (i == YBTupleIdAttributeNumber)
+		{
+			/* ybctid */
+			if (valstr != NULL)
+			{
+				Datum		datum;
 
+				datum = DirectFunctionCall1(byteain, CStringGetDatum(valstr));
+				ybctid = DatumGetByteaP(datum);
+			}
+		}
+		errpos.cur_attno = 0;
 		j++;
 	}
 
@@ -8546,6 +8787,9 @@ make_tuple_from_result_row(PGresult *res,
 	 */
 	if (ctid)
 		tuple->t_self = tuple->t_data->t_ctid = *ctid;
+
+	if (ybctid)
+		COPY_YBCTID(PointerGetDatum(ybctid), HEAPTUPLE_YBCTID(tuple));
 
 	/*
 	 * Stomp on the xmin, xmax, and cmin fields from the tuple created by
@@ -8636,6 +8880,8 @@ conversion_error_callback(void *arg)
 				attname = strVal(list_nth(rte->eref->colnames, colno - 1));
 			else if (colno == SelfItemPointerAttributeNumber)
 				attname = "ctid";
+			else if (colno == YBTupleIdAttributeNumber)
+				attname = "ybctid";
 		}
 	}
 	else if (rel)
@@ -8653,6 +8899,8 @@ conversion_error_callback(void *arg)
 		}
 		else if (errpos->cur_attno == SelfItemPointerAttributeNumber)
 			attname = "ctid";
+		else if (errpos->cur_attno == YBTupleIdAttributeNumber)
+			attname = "ybctid";
 	}
 
 	if (relname && is_wholerow)
@@ -8814,4 +9062,117 @@ get_batch_size_option(Relation rel)
 	}
 
 	return batch_size;
+}
+
+static const char *
+yb_server_type_to_string(YbPgFdwServerType server_type)
+{
+	switch (server_type)
+	{
+		case PG_FDW_SERVER_POSTGRES:
+			return yb_server_types[PG_FDW_SERVER_POSTGRES];
+		case PG_FDW_SERVER_YUGABYTEDB:
+			return yb_server_types[PG_FDW_SERVER_POSTGRES];
+		default:
+			elog(ERROR, "Unsupported server type: %d", server_type);
+	}
+
+	return NULL;				/* keep compiler happy */
+}
+
+static YbPgFdwServerType
+yb_get_server_type(const char *server_type)
+{
+	if (pg_strncasecmp(server_type,
+					   yb_server_types[PG_FDW_SERVER_POSTGRES],
+					   strlen(yb_server_types[PG_FDW_SERVER_POSTGRES])) == 0)
+		return PG_FDW_SERVER_POSTGRES;
+	else if (pg_strncasecmp(server_type,
+							yb_server_types[PG_FDW_SERVER_YUGABYTEDB],
+							strlen(yb_server_types[PG_FDW_SERVER_YUGABYTEDB])) == 0)
+		return PG_FDW_SERVER_YUGABYTEDB;
+	else if (pg_strncasecmp(server_type,
+							yb_server_types[PG_FDW_SERVER_FEDERATED_YUGABYTEDB],
+							strlen(yb_server_types[PG_FDW_SERVER_FEDERATED_YUGABYTEDB])) == 0)
+		return PG_FDW_SERVER_FEDERATED_YUGABYTEDB;
+
+	return PG_FDW_SERVER_UNKNOWN;
+}
+
+bool
+yb_is_valid_server_type(const char *server_type)
+{
+	return yb_get_server_type(server_type) != PG_FDW_SERVER_UNKNOWN;
+}
+
+static YbPgFdwServerType
+yb_get_server_type_from_ftrelid(Oid relid)
+{
+	ForeignTable *table = GetForeignTable(relid);
+	ForeignServer *server = GetForeignServer(table->serverid);
+	ListCell   *lc;
+
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "server_type") == 0)
+			return yb_get_server_type(defGetString(def));
+	}
+
+	return PG_FDW_SERVER_UNKNOWN;
+}
+
+static AttrNumber
+yb_get_min_attr_from_server_type(YbPgFdwServerType server_type)
+{
+	switch (server_type)
+	{
+		case PG_FDW_SERVER_POSTGRES:
+		case PG_FDW_SERVER_UNKNOWN:
+			return FirstLowInvalidHeapAttributeNumber;
+		case PG_FDW_SERVER_YUGABYTEDB:
+		case PG_FDW_SERVER_FEDERATED_YUGABYTEDB:
+			return YBFirstLowInvalidAttributeNumber;
+		default:
+			elog(ERROR, "Unsupported server type: %d", server_type);
+	}
+
+	return InvalidAttrNumber;	/* keep compiler happy */
+}
+
+extern AttrNumber
+yb_get_min_attr_from_ftrelid(Oid relid)
+{
+	return yb_get_min_attr_from_server_type(yb_get_server_type_from_ftrelid(relid));
+}
+
+static const char *
+yb_get_tuple_identifier_colname(YbPgFdwServerType server_type)
+{
+	switch (server_type)
+	{
+		case PG_FDW_SERVER_POSTGRES:
+		case PG_FDW_SERVER_UNKNOWN:
+			return "ctid";
+		case PG_FDW_SERVER_YUGABYTEDB:
+		case PG_FDW_SERVER_FEDERATED_YUGABYTEDB:
+			return "ybctid";
+		default:
+			elog(ERROR, "Unsupported server type: %d", server_type);
+	}
+
+	return NULL;				/* keep compiler happy */
+}
+
+static PGresult *
+YbGlobalViewReadExecScan(YbcPgGlobalViewRead yb_gvr, const char *query)
+{
+	YbcRemotePgExecResult yb_result = YBCPgGlobalViewReadExecScan(yb_gvr, query);
+	PGresult *res = libpqsrv_PQwrap(YBCPgResultFromPB(yb_result.pgresult, yb_result.pgresult_size));
+	/*
+	 * This makes sure that we continue to query other tservers even if we get error
+	 * from one tserver due to timeouts / tserver down etc.
+	 */
+	return res ? res : libpqsrv_PQwrap(PQmakeEmptyPGresult(NULL, PGRES_TUPLES_OK));
 }

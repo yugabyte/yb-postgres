@@ -165,6 +165,28 @@ typedef struct Port
 	HbaLine    *hba;
 
 	/*
+	 * Whether yb-tserver to postgres authentication is used.  This information
+	 * needs to be saved separately from hba because hba gets deallocated after
+	 * the authentication cycle.
+	 */
+	bool		yb_is_tserver_auth_method;
+
+	/*
+	 * YB: To be used during Authentication, identifies whether authentication
+	 * is invoked due to Auth Passthrough Request packet.
+	 */
+	bool		yb_is_auth_passthrough_req;
+	bool		yb_has_auth_passthrough_failed;
+
+	/*
+	 * YB: To be used for the authentication of logical connections from the
+	 * connection manager either via auth passthrough or the special
+	 * authentication backend.
+	 * It identifies whether the logical connection is encrypted.
+	 */
+	bool		yb_is_ssl_enabled_in_logical_conn;
+
+	/*
 	 * TCP keepalive and user timeout settings.
 	 *
 	 * default values are 0 if AF_UNIX or not yet known; current values are 0

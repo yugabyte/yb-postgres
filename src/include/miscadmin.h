@@ -28,6 +28,15 @@
 #include "datatype/timestamp.h" /* for TimestampTz */
 #include "pgtime.h"				/* for pg_time_t */
 
+/*
+ * YB_TODO_PG19MERGE: YB used to `#include "storage/proc.h"` here "for MyProc"
+ * so callers that #include "miscadmin.h" got MyProc transitively. That
+ * created an include cycle with PG19's PGPROC (which now uses BackendType
+ * from this file). Removed; callers that need MyProc should include
+ * "storage/proc.h" directly. See the corresponding note in storage/spin.h.
+ */
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 #define InvalidPid				(-1)
 
@@ -109,6 +118,7 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
 
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
+extern void YBCheckForInterrupts(void);
 
 /* Test whether an interrupt is pending */
 #ifndef WIN32
@@ -149,6 +159,7 @@ do { \
 	QueryCancelHoldoffCount--; \
 } while(0)
 
+#ifdef FRONTEND					/* YB */
 #define START_CRIT_SECTION()  (CritSectionCount++)
 
 #define END_CRIT_SECTION() \
@@ -156,6 +167,33 @@ do { \
 	Assert(CritSectionCount > 0); \
 	CritSectionCount--; \
 } while(0)
+
+#else							/* YB: !FRONTEND */
+/*
+ * YB_TODO_PG19MERGE: YB's per-backend "entered critical section" tracking
+ * used to be inline in these macros via MyProc->ybEnteredCriticalSection.
+ * That forced miscadmin.h to include proc.h "for MyProc", which combined
+ * with PG19's PGPROC gaining a BackendType field (whose type lives in
+ * miscadmin.h) created an include cycle. As an interim, move the YB body
+ * into non-inline helpers in proc.c.
+ */
+extern void YbEnterCriticalSection(void);
+extern void YbExitCriticalSection(void);
+
+#define START_CRIT_SECTION()  \
+do { \
+	YbEnterCriticalSection(); \
+	CritSectionCount++; \
+} while(0)
+
+#define END_CRIT_SECTION() \
+do { \
+	Assert(CritSectionCount > 0); \
+	CritSectionCount--; \
+	if (CritSectionCount == 0) \
+		YbExitCriticalSection(); \
+} while(0)
+#endif							/* YB: FRONTEND */
 
 
 /*****************************************************************************
@@ -291,6 +329,10 @@ extern PGDLLIMPORT double VacuumCostDelay;
 extern PGDLLIMPORT int VacuumCostBalance;
 extern PGDLLIMPORT bool VacuumCostActive;
 
+extern PGDLLIMPORT char *YbSystemDbName;
+extern PGDLLIMPORT char *PgYbNotificationsTableName;
+extern PGDLLIMPORT char *PgYbNotificationsPublicationName;
+
 
 /* in utils/misc/stack_depth.c */
 
@@ -387,6 +429,11 @@ typedef enum BackendType
 	 * entry.
 	 */
 	B_LOGGER,
+	YB_YSQL_CONN_MGR,
+	YB_YSQL_CONN_MGR_WAL_SENDER,
+	YB_AUTO_ANALYZE_BACKEND,
+	YB_INDEX_BACKFILL_DDL,
+	YB_MATVIEW_REFRESH_DDL,
 } BackendType;
 
 #define BACKEND_NUM_TYPES (B_LOGGER + 1)
@@ -524,8 +571,22 @@ extern void InitPostgres(const char *in_dbname, Oid dboid,
 						 const char *username, Oid useroid,
 						 uint32 flags,
 						 char *out_dbname);
+
+extern void YbInitPostgres(const char *in_dbname, Oid dboid,
+						   const char *username, Oid useroid,
+						   uint32 flags,
+						   char *out_dbname,
+						   const YbcPgInitPostgresInfo *yb_info);
+extern long YbGetAuthorizedConnections();
+extern void YbLogAuthPassthroughConnReceived(struct Port *port);
+extern void YbLogAuthPassthroughConnAuthenticated(struct Port *port);
+
 extern void BaseInit(void);
 extern void StoreConnectionWarning(char *msg, char *detail);
+
+extern void YbCheckMyDatabase(const char *name, bool am_superuser,
+							  bool override_allow_connections, Oid db_oid);
+extern void YbAuthPassthroughSetupGUCAndReport(void);
 
 /* in utils/init/miscinit.c */
 extern PGDLLIMPORT bool IgnoreSystemIndexes;
@@ -558,5 +619,17 @@ extern void RestoreClientConnectionInfo(char *conninfo);
 
 /* in executor/nodeHash.c */
 extern size_t get_hash_memory_limit(void);
+
+/* YB */
+extern PGDLLIMPORT volatile sig_atomic_t YbLogCatcacheStatsPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern bool IsYsqlUpgrade;
+extern PGDLLIMPORT bool MyDatabaseColocated;
+extern PGDLLIMPORT Oid YbDatabaseIdForNewObjectId;
+extern PGDLLIMPORT bool MyColocatedDatabaseLegacy;
+extern PGDLLIMPORT bool YbTablegroupCatalogExists;
+extern PGDLLIMPORT bool YbLoginProfileCatalogsExist;
 
 #endif							/* MISCADMIN_H */

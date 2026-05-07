@@ -1574,8 +1574,12 @@ CreateConflictDetectionSlot(void)
 	ereport(LOG,
 			errmsg("creating replication conflict detection slot"));
 
+	/* YB_TODO_PG19MERGE: Check YB args */
 	ReplicationSlotCreate(CONFLICT_DETECTION_SLOT, false, RS_PERSISTENT, false,
-						  false, false, false);
+						  false, false, false,
+						  NULL /* yb_plugin_name */, CRS_NOEXPORT_SNAPSHOT,
+						  NULL /* yb_consistent_snapshot_time */,
+						  CRS_SEQUENCE, YB_CRS_TRANSACTION);
 
 	init_conflict_slot_xmin();
 }

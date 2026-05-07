@@ -23,6 +23,9 @@
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
+/* YB includes */
+#include "yb/util/debug/leak_annotations.h"
+
 #if !defined(WIN32)
 extern char **environ;
 #endif
@@ -111,6 +114,16 @@ extern char **ps_status_new_environ;
 char	  **ps_status_new_environ;
 #endif
 
+#if defined(PS_USE_CLOBBER_ARGV)
+static char **
+allocate_new_environ(int i)
+{
+	char	  **result = (char **) malloc((i + 1) * sizeof(char *));
+
+	__lsan_ignore_object(result);
+	return result;
+}
+#endif
 
 /*
  * Call this early in startup to save the original argc/argv values.
@@ -200,7 +213,7 @@ save_ps_display_args(int argc, char **argv)
 		/*
 		 * move the environment out of the way
 		 */
-		new_environ = (char **) malloc((i + 1) * sizeof(char *));
+		new_environ = allocate_new_environ(i);;
 		if (!new_environ)
 		{
 			write_stderr("out of memory\n");

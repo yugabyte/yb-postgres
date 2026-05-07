@@ -85,4 +85,13 @@ extern RelOptInfo *create_unique_paths(PlannerInfo *root, RelOptInfo *rel,
 extern char *choose_plan_name(PlannerGlobal *glob, const char *name,
 							  bool always_number);
 
+/* YB */
+extern char *ybGenerateHintString(PlannedStmt *plannedStmt);
+extern bool ybComparePlanShapesAndMethods(PlannedStmt *plannedStmt1, Plan *plan1, PlannedStmt *plannedStmt2, Plan *plan2, bool trace);
+extern uint32 ybGetNextUid(PlannerGlobal *glob);
+extern uint32 ybGetNextNodeUid(PlannerGlobal *glob);
+extern void ybInitHintedUids(PlannerGlobal *glob);
+extern bool ybIsHintedUid(PlannerGlobal *glob, uint32 uid);
+extern uint64 ybGetPlanId(PlannedStmt *plannedStmt);
+
 #endif							/* PLANNER_H */

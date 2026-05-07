@@ -221,8 +221,12 @@ repack_setup_logical_decoding(Oid relid)
 	 * RS_TEMPORARY so that the slot gets cleaned up on ERROR.
 	 */
 	snprintf(NameStr(slotname), NAMEDATALEN, "repack_%d", MyProcPid);
+	/* YB_TODO_PG19MERGE: review YB arguments */
 	ReplicationSlotCreate(NameStr(slotname), true, RS_TEMPORARY, false, true,
-						  false, false);
+						  false, false,
+						  NULL /* yb_plugin_name */ , CRS_NOEXPORT_SNAPSHOT,
+						  NULL /* yb_consistent_snapshot_time */ ,
+						  CRS_SEQUENCE, YB_CRS_TRANSACTION);
 
 	EnsureLogicalDecodingEnabled();
 

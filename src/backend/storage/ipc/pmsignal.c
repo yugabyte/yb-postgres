@@ -30,6 +30,8 @@
 #include "storage/subsystems.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
 
 /*
  * The postmaster is signaled by its children by sending SIGUSR1.  The
@@ -407,6 +409,14 @@ PostmasterDeathSignalInit(void)
 {
 #ifdef USE_POSTMASTER_DEATH_SIGNAL
 	int			signum = POSTMASTER_DEATH_SIGNAL;
+
+	/*
+	 * In YB, all backends are stateless and upon PG master termination, all
+	 * backend processes should also terminate regardless what state they are
+	 * in. No clean-up procedure is needed in the backends.
+	 */
+	if (YBIsEnabledInPostgresEnvVar())
+		signum = SIGKILL;
 
 	/* Register our signal handler. */
 	pqsignal(signum, postmaster_death_handler);

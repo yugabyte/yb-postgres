@@ -65,6 +65,10 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
@@ -74,6 +78,12 @@ ExecutorEnd_hook_type ExecutorEnd_hook = NULL;
 
 /* Hook for plugin to get control in ExecCheckPermissions() */
 ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook = NULL;
+
+/*
+ * YB: Flag to indicate if the session stats should be refreshed
+ * before the execution of the query
+ */
+bool		yb_refresh_stats_before_exec = true;
 
 /* decls for local routines only used within this module */
 static void InitPlan(QueryDesc *queryDesc, int eflags);
@@ -152,6 +162,9 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	/* caller must ensure the query's snapshot is active */
 	Assert(GetActiveSnapshot() == queryDesc->snapshot);
 
+	if (yb_enable_pg_stat_statements_docdb_metrics)
+		YbSetMetricsCaptureTypeIfUnset(YB_YQL_METRICS_CAPTURE_PGSS_METRICS);
+
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
 	 * planned to non-temporary tables.  EXPLAIN is considered read-only.
@@ -166,8 +179,10 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * We have lower-level defenses in CommandCounterIncrement and elsewhere
 	 * against performing unsafe operations in parallel mode, but this gives a
 	 * more user-friendly error message.
+	 *
+	 * YB: We also notify pggate whether the statement is read only.
 	 */
-	if ((XactReadOnly || IsInParallelMode()) &&
+	if ((IsYugaByteEnabled() || XactReadOnly || IsInParallelMode()) &&
 		!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		ExecCheckXactReadOnly(queryDesc->plannedstmt);
 
@@ -308,6 +323,18 @@ void
 ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count)
 {
+	/*
+	 * YB: Refresh session stats only once per query.
+	 * Securing YbRefreshSessionStatsBeforeExecution() behind yb_refresh_stats_before_exec
+	 * to avoid redundant refreshes for queries with multiple ExecutorRun calls
+	 * in case of triggers, foreign key checks, etc.
+	 */
+	if (yb_refresh_stats_before_exec)
+	{
+		YbRefreshSessionStatsBeforeExecution();
+		yb_refresh_stats_before_exec = false;
+	}
+
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count);
 	else
@@ -334,6 +361,9 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	/* caller must ensure the query's snapshot is active */
 	Assert(GetActiveSnapshot() == estate->es_snapshot);
+
+	if (IsYugaByteEnabled())
+		YBBeginOperationsBuffering();
 
 	/*
 	 * Switch into per-query memory context
@@ -453,6 +483,12 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
 
+	/*
+	 * YB: Flush buffered operations straight before elapsed time calculation.
+	 */
+	if (IsYugaByteEnabled())
+		YBEndOperationsBuffering();
+
 	if (queryDesc->query_instr)
 		InstrStop(queryDesc->query_instr);
 
@@ -534,6 +570,9 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	queryDesc->estate = NULL;
 	queryDesc->planstate = NULL;
 	queryDesc->query_instr = NULL;
+	queryDesc->yb_query_stats = NULL;
+	if (yb_enable_pg_stat_statements_docdb_metrics)
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_NONE);
 }
 
 /* ----------------------------------------------------------------
@@ -718,7 +757,10 @@ ExecCheckOneRelPerms(RTEPermissionInfo *perminfo)
 			while ((col = bms_next_member(perminfo->selectedCols, col)) >= 0)
 			{
 				/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-				AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+				/*
+				 * YB: use YBGetFirstLowInvalidAttributeNumberFromOid instead
+				 */
+				AttrNumber	attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 				if (attno == InvalidAttrNumber)
 				{
@@ -783,7 +825,8 @@ ExecCheckPermissionsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
 	while ((col = bms_next_member(modifiedCols, col)) >= 0)
 	{
 		/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+		/* YB: use YBGetFirstLowInvalidAttributeNumberFromOid instead */
+		AttrNumber	attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 		if (attno == InvalidAttrNumber)
 		{
@@ -808,11 +851,14 @@ ExecCheckPermissionsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
  * Note: in a Hot Standby this would need to reject writes to temp
  * tables just as we do in parallel mode; but an HS standby can't have created
  * any temp tables in the first place, so no need to check that.
+ *
+ * YB: We also notify pggate whether the statement is read only.
  */
 static void
 ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 {
 	ListCell   *l;
+	bool		yb_is_read_only = true;
 
 	/*
 	 * Fail if write permissions are requested in parallel mode for table
@@ -829,10 +875,21 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 			continue;
 
 		PreventCommandIfReadOnly(CreateCommandName((Node *) plannedstmt));
+		yb_is_read_only = false;
 	}
 
 	if (plannedstmt->commandType != CMD_SELECT || plannedstmt->hasModifyingCTE)
+	{
 		PreventCommandIfParallelMode(CreateCommandName((Node *) plannedstmt));
+		yb_is_read_only = false;
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		if (plannedstmt->rowMarks)
+			yb_is_read_only = false;
+		HandleYBStatus(YBCPgSetReadOnlyStmt(yb_is_read_only));
+	}
 }
 
 
@@ -859,7 +916,10 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	/*
 	 * Do permissions checks
 	 */
-	ExecCheckPermissions(rangeTable, plannedstmt->permInfos, true);
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension))
+	{
+		ExecCheckPermissions(rangeTable, plannedstmt->permInfos, true);
+	}
 
 	/*
 	 * initialize the node's execution state
@@ -993,6 +1053,8 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 		i++;
 	}
+
+	queryDesc->yb_query_stats = InstrAlloc(queryDesc->instrument_options);
 
 	/*
 	 * Initialize the private state information for all the nodes in the query
@@ -1939,7 +2001,7 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 							TupleTableSlot *slot,
 							EState *estate)
 {
-	Oid			root_relid;
+	Relation	rel;
 	TupleDesc	tupdesc;
 	char	   *val_desc;
 	Bitmapset  *modifiedCols;
@@ -1956,7 +2018,7 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 		TupleDesc	old_tupdesc;
 		AttrMap    *map;
 
-		root_relid = RelationGetRelid(rootrel->ri_RelationDesc);
+		rel = rootrel->ri_RelationDesc;
 		tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
 
 		old_tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
@@ -1975,13 +2037,13 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 	}
 	else
 	{
-		root_relid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+		rel = resultRelInfo->ri_RelationDesc;
 		tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
 		modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
 								 ExecGetUpdatedCols(resultRelInfo, estate));
 	}
 
-	val_desc = ExecBuildSlotValueDescription(root_relid,
+	val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
 											 slot,
 											 tupdesc,
 											 modifiedCols,
@@ -2007,7 +2069,8 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
  */
 void
 ExecConstraints(ResultRelInfo *resultRelInfo,
-				TupleTableSlot *slot, EState *estate)
+				TupleTableSlot *slot, EState *estate,
+				ModifyTableState *mtstate)
 {
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
@@ -2028,6 +2091,45 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 		for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
 			Form_pg_attribute att = TupleDescAttr(tupdesc, attnum - 1);
+
+			/*
+			 * YB_TODO_PG19MERGE: PG refactored NOT NULL error reporting into
+			 * ReportNotNullViolationError
+			 * (commit cdc168ad4b22ea4183f966688b245cabb5935d1f)
+			 * Does YB code here require any changes?
+			 */
+			/*
+			 * YB: Below we check if attribute belongs to the modified columns
+			 * for the NOT NULL constraint and if so, performs single-row
+			 * updates. Thus modified columns must be calculated beforehand.
+			 */
+			if (resultRelInfo->ri_RootResultRelInfo)
+			{
+				ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
+
+				modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+										 ExecGetUpdatedCols(rootrel, estate));
+			}
+			else
+			{
+				modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+										 ExecGetUpdatedCols(resultRelInfo, estate));
+			}
+
+			bool		att_in_modified_cols = bms_is_member(att->attnum - YBGetFirstLowInvalidAttributeNumber(rel),
+															 modifiedCols);
+
+			if (mtstate && !mtstate->yb_fetch_target_tuple && !att_in_modified_cols)
+			{
+				/*
+				 * Without a target tuple, we only know the values of the
+				 * modified columns. But in this case it is safe to skip the
+				 * unmodified columns anyway.
+				 */
+				bms_free(modifiedCols);
+				continue;
+			}
+			bms_free(modifiedCols);
 
 			if (att->attnotnull && att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 				notnull_virtual_attrs = lappend_int(notnull_virtual_attrs, attnum);
@@ -2338,6 +2440,7 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
 					else
 						modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
 												 ExecGetUpdatedCols(resultRelInfo, estate));
+
 					val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
 															 slot,
 															 tupdesc,
@@ -2485,7 +2588,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 			 */
 			aclresult = pg_attribute_aclcheck(reloid, att->attnum,
 											  GetUserId(), ACL_SELECT);
-			if (bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber,
+			if (bms_is_member(att->attnum - YBGetFirstLowInvalidAttributeNumberFromOid(reloid),
 							  modifiedCols) || aclresult == ACLCHECK_OK)
 			{
 				column_perm = any_perm = true;
@@ -2616,7 +2719,14 @@ ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist)
 	if (erm->markType != ROW_MARK_COPY)
 	{
 		/* need ctid for all methods other than COPY */
-		snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		if (IsYBBackedRelation(erm->relation))
+		{
+			snprintf(resname, sizeof(resname), "ybctid%u", erm->rowmarkId);
+		}
+		else
+		{
+			snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		}
 		aerm->ctidAttNo = ExecFindJunkAttributeInTlist(targetlist,
 													   resname);
 		if (!AttributeNumberIsValid(aerm->ctidAttNo))

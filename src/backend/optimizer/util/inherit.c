@@ -38,6 +38,10 @@
 #include "partitioning/partprune.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "executor/ybExpr.h"
+#include "pg_yb_utils.h"
+
 
 static void expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 									   RangeTblEntry *parentrte,
@@ -51,7 +55,8 @@ static void expand_single_inheritance_child(PlannerInfo *root,
 											RangeTblEntry **childrte_p,
 											Index *childRTindex_p);
 static Bitmapset *translate_col_privs(const Bitmapset *parent_privs,
-									  List *translated_vars);
+									  List *translated_vars,
+									  AttrNumber yb_min_attr);
 static Bitmapset *translate_col_privs_multilevel(PlannerInfo *root,
 												 RelOptInfo *rel,
 												 RelOptInfo *parent_rel,
@@ -347,7 +352,7 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	 * that survive pruning.  Below, we will initialize child objects for the
 	 * surviving partitions.
 	 */
-	relinfo->live_parts = prune_append_rel_partitions(relinfo);
+	relinfo->live_parts = prune_append_rel_partitions(relinfo, partdesc->oids);
 
 	/* Expand simple_rel_array and friends to hold child objects. */
 	num_live_parts = bms_num_members(relinfo->live_parts);
@@ -415,7 +420,8 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 			Bitmapset  *child_updatedCols;
 
 			child_updatedCols = translate_col_privs(parent_updatedCols,
-													appinfo->translated_vars);
+													appinfo->translated_vars,
+													YBGetFirstLowInvalidAttributeNumber(parentrel));
 
 			expand_partitioned_rtentry(root, childrelinfo,
 									   childrte, childRTindex,
@@ -688,7 +694,9 @@ get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
 	 * on the updatedCols, and add them to the result.
 	 */
 	extraUpdatedCols = get_dependent_generated_columns(root, rel->relid,
-													   updatedCols);
+													   updatedCols,
+													   NULL /* yb_generated_cols_source */ ,
+													   NULL /* yb_relation */ );
 
 	return bms_union(updatedCols, extraUpdatedCols);
 }
@@ -706,7 +714,8 @@ get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
  */
 static Bitmapset *
 translate_col_privs(const Bitmapset *parent_privs,
-					List *translated_vars)
+					List *translated_vars,
+					AttrNumber yb_min_attr)
 {
 	Bitmapset  *child_privs = NULL;
 	bool		whole_row;
@@ -714,16 +723,16 @@ translate_col_privs(const Bitmapset *parent_privs,
 	ListCell   *lc;
 
 	/* System attributes have the same numbers in all tables */
-	for (attno = FirstLowInvalidHeapAttributeNumber + 1; attno < 0; attno++)
+	for (attno = yb_min_attr + 1; attno < 0; attno++)
 	{
-		if (bms_is_member(attno - FirstLowInvalidHeapAttributeNumber,
+		if (bms_is_member(attno - yb_min_attr,
 						  parent_privs))
 			child_privs = bms_add_member(child_privs,
-										 attno - FirstLowInvalidHeapAttributeNumber);
+										 attno - yb_min_attr);
 	}
 
 	/* Check if parent has whole-row reference */
-	whole_row = bms_is_member(InvalidAttrNumber - FirstLowInvalidHeapAttributeNumber,
+	whole_row = bms_is_member(InvalidAttrNumber - yb_min_attr,
 							  parent_privs);
 
 	/* And now translate the regular user attributes, using the vars list */
@@ -736,10 +745,10 @@ translate_col_privs(const Bitmapset *parent_privs,
 		if (var == NULL)		/* ignore dropped columns */
 			continue;
 		if (whole_row ||
-			bms_is_member(attno - FirstLowInvalidHeapAttributeNumber,
+			bms_is_member(attno - yb_min_attr,
 						  parent_privs))
 			child_privs = bms_add_member(child_privs,
-										 var->varattno - FirstLowInvalidHeapAttributeNumber);
+										 var->varattno - yb_min_attr);
 	}
 
 	return child_privs;
@@ -781,7 +790,8 @@ translate_col_privs_multilevel(PlannerInfo *root, RelOptInfo *rel,
 	appinfo = root->append_rel_array[rel->relid];
 	Assert(appinfo != NULL);
 
-	return translate_col_privs(parent_cols, appinfo->translated_vars);
+	return translate_col_privs(parent_cols, appinfo->translated_vars,
+							   YBGetFirstLowInvalidAttributeNumberFromOid(appinfo->parent_reloid));
 }
 
 /*
@@ -902,7 +912,17 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 										   pseudoconstant,
 										   rinfo->security_level,
 										   NULL, NULL, NULL);
-
+			if (childrel->is_yb_relation)
+			{
+				/*
+				 * Even if parent clause was not pushable, parts of it still
+				 * maybe after they have been split by make_ands_implicit.
+				 * Hence re-evaluate pushability.
+				 */
+				childrinfo->yb_pushable = rinfo->yb_pushable ||
+					YbCanPushdownExpr(childrinfo->clause, NULL,
+									  planner_rt_fetch(parentrel->relid, root)->relid);
+			}
 			childquals = lappend(childquals, childrinfo);
 			/* track minimum security level among child quals */
 			cq_min_security = Min(cq_min_security, childrinfo->security_level);

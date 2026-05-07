@@ -14,6 +14,7 @@
  *		Acquire a spinlock, waiting if necessary.
  *		Time out and abort() if unable to acquire the lock in a
  *		"reasonable" amount of time --- typically ~ 1 minute.
+ *		YB note: instead of 1 minute, it's roughly 15 seconds.
  *
  *	void SpinLockRelease(volatile slock_t *lock)
  *		Unlock a previously acquired lock.
@@ -46,6 +47,20 @@
 
 #include "storage/s_lock.h"
 
+/*
+ * YB_TODO_PG19MERGE: YB's spinlock-held counter (MyProc->ybSpinLocksAcquired)
+ * used to be bumped inline from SpinLockAcquire/Release. That required spin.h
+ * to include miscadmin.h and proc.h (for IsUnderPostmaster and MyProc), which
+ * in turn required miscadmin.h to include proc.h "for MyProc" so consumers of
+ * miscadmin.h could see MyProc. That tangle worked in PG15 but breaks in PG19
+ * because PGPROC now contains a BackendType field whose type is defined in
+ * miscadmin.h; the resulting include cycle leaves BackendType undeclared when
+ * proc.h needs it. As an interim, move the tracking out of inline into
+ * non-inline helpers that live in proc.c (where the full headers are visible)
+ */
+extern void YbSpinLockTrackAcquire(void);
+extern void YbSpinLockTrackRelease(void);
+
 static inline void
 SpinLockInit(volatile slock_t *lock)
 {
@@ -55,6 +70,7 @@ SpinLockInit(volatile slock_t *lock)
 static inline void
 SpinLockAcquire(volatile slock_t *lock)
 {
+	YbSpinLockTrackAcquire();
 	S_LOCK(lock);
 }
 
@@ -62,6 +78,7 @@ static inline void
 SpinLockRelease(volatile slock_t *lock)
 {
 	S_UNLOCK(lock);
+	YbSpinLockTrackRelease();
 }
 
 #endif							/* SPIN_H */

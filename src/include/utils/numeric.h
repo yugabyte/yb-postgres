@@ -17,6 +17,8 @@
 #include "common/pg_prng.h"
 #include "fmgr.h"
 
+#include "c.h"					/* YB include */
+
 /* forward declaration to avoid node.h include */
 typedef struct Node Node;
 
@@ -81,6 +83,13 @@ NumericGetDatum(Numeric X)
 #define PG_GETARG_NUMERIC(n)	  DatumGetNumeric(PG_GETARG_DATUM(n))
 #define PG_GETARG_NUMERIC_COPY(n) DatumGetNumericCopy(PG_GETARG_DATUM(n))
 #define PG_RETURN_NUMERIC(x)	  return NumericGetDatum(x)
+
+
+typedef struct Int8TransTypeData
+{
+	int64		count;
+	int64		sum;
+} Int8TransTypeData;
 
 /*
  * Utility functions in numeric.c
