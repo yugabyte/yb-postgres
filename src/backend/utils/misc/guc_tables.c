@@ -519,6 +519,68 @@ static const struct config_enum_entry data_checksums_options[] = {
 	{NULL, 0, false}
 };
 
+/* YB enum-options arrays */
+const struct config_enum_entry yb_batch_detection_mechanism_options[] = {
+	{"detect_by_peeking", DETECT_BY_PEEKING, false},
+	{"assume_all_batch_executions", ASSUME_ALL_BATCH_EXECUTIONS, false},
+	{"ignore_batch_delete_and_update_may_fail", IGNORE_BATCH_DELETE_AND_UPDATE_MAY_FAIL, false},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry yb_read_after_commit_visibility_options[] = {
+	{"strict", YB_STRICT_READ_AFTER_COMMIT_VISIBILITY, false},
+	{"relaxed", YB_RELAXED_READ_AFTER_COMMIT_VISIBILITY, false},
+	{"deferred", YB_DEFERRED_READ_AFTER_COMMIT_VISIBILITY, false},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry yb_sampling_algorithm_options[] = {
+	{"full_table_scan", YB_SAMPLING_ALGORITHM_FULL_TABLE_SCAN, false},
+	{"block_based_sampling", YB_SAMPLING_ALGORITHM_BLOCK_BASED_SAMPLING, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_cost_model_options[] = {
+	{"off", YB_COST_MODEL_OFF, false},
+	{"on", YB_COST_MODEL_ON, false},
+	{"legacy_mode", YB_COST_MODEL_LEGACY, false},
+	{"legacy_stats_mode", YB_COST_MODEL_LEGACY_STATS, false},
+	{"legacy_bnl_mode", YB_COST_MODEL_LEGACY_BNL, false},
+	{"legacy_stats_bnl_mode", YB_COST_MODEL_LEGACY_STATS_BNL, false},
+	{"legacy_ignore_stats_bnl_mode", YB_COST_MODEL_LEGACY_IGNORE_STATS_BNL, false},
+	{"true", YB_COST_MODEL_ON, true},
+	{"false", YB_COST_MODEL_OFF, true},
+	{"yes", YB_COST_MODEL_ON, true},
+	{"no", YB_COST_MODEL_OFF, true},
+	{"1", YB_COST_MODEL_ON, true},
+	{"0", YB_COST_MODEL_OFF, true},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_qpm_track_options[] =
+{
+	{"none", YB_QPM_TRACK_NONE, false},
+	{"top", YB_QPM_TRACK_TOP, false},
+	{"all", YB_QPM_TRACK_ALL, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_cache_replacement_algorithm_options[] =
+{
+	{"simple_clock_lru", YB_QPM_SIMPLE_CLOCK_LRU, false},
+	{"true_lru", YB_QPM_TRUE_LRU, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_qpm_plan_format_options[] =
+{
+	{"text", EXPLAIN_FORMAT_TEXT, false},
+	{"xml", EXPLAIN_FORMAT_XML, false},
+	{"json", EXPLAIN_FORMAT_JSON, false},
+	{"yaml", EXPLAIN_FORMAT_YAML, false},
+	{NULL, 0, false}
+};
+
 /*
  * Options for enum values stored in other modules
  */
@@ -675,6 +737,19 @@ char	   *role_string;
 /* should be static, but guc.c needs to get at this */
 bool		in_hot_standby_guc;
 
+/* YB globals */
+int			yb_log_min_backtraces = FATAL;
+bool		yb_enable_memory_tracking = true;
+static char *yb_effective_transaction_isolation_level_string;
+static char *yb_xcluster_consistency_level_string;
+static char *yb_read_time_string;
+static char *yb_neg_catcache_ids_string;
+static bool yb_conn_mgr_modifying_defaults = false;
+bool		yb_test_skip_binding_scan_keys;
+static bool yb_bypass_cond_recheck;
+static bool yb_pushdown_is_not_null;
+static bool yb_pushdown_strict_inequality;
+
 /*
  * set default log_min_messages to WARNING for all process types
  */
@@ -798,6 +873,7 @@ const char *const config_type_names[] =
 {
 	[PGC_BOOL] = "bool",
 	[PGC_INT] = "integer",
+	[PGC_OID] = "oid",			/* YB added */
 	[PGC_REAL] = "real",
 	[PGC_STRING] = "string",
 	[PGC_ENUM] = "enum",

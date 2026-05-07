@@ -224,6 +224,10 @@ typedef struct
 									 (coordinate)->sharedsort == NULL ? 0 : \
 									 (coordinate)->isWorker ? 1 : 2)
 
+/* YB */
+#define YB_SORT_UNINITIALIZED -1
+extern const char *yb_sort_type_name(int sort_type);
+
 #define TuplesortstateGetPublic(state) ((TuplesortPublic *) state)
 
 /* When using this macro, beware of double evaluation of len */

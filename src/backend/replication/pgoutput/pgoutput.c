@@ -36,6 +36,9 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "pgoutput",
 					.version = PG_VERSION
@@ -83,6 +86,8 @@ static void pgoutput_stream_commit(struct LogicalDecodingContext *ctx,
 static void pgoutput_stream_prepare_txn(LogicalDecodingContext *ctx,
 										ReorderBufferTXN *txn, XLogRecPtr prepare_lsn);
 
+static void yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid);
+
 static bool publications_valid;
 
 static List *LoadPublications(List *pubnames);
@@ -91,6 +96,15 @@ static void publication_invalidation_cb(Datum arg, SysCacheIdentifier cacheid,
 static void send_repl_origin(LogicalDecodingContext *ctx,
 							 ReplOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
+
+/*
+ * This indicates whether the plugin being used is yboutput or pgoutput. In
+ * yboutput mode, we also support yb-specific replica identity
+ * (CHANGE for now).
+ */
+static bool yb_is_yboutput_mode;
+
+static void yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity);
 
 /*
  * Only 3 publication actions are used for row filtering ("insert", "update",
@@ -284,6 +298,12 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->stream_truncate_cb = pgoutput_truncate;
 	/* transaction streaming - two-phase commit */
 	cb->stream_prepare_cb = pgoutput_stream_prepare_txn;
+
+	if (IsYugaByteEnabled())
+	{
+		cb->yb_schema_change_cb = yb_pgoutput_schema_change;
+		cb->yb_support_yb_specifc_replica_identity_cb = yb_support_yb_specific_replica_identity;
+	}
 }
 
 static void
@@ -550,6 +570,9 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 		else
 			ctx->twophase_opt_given = true;
 
+		if (IsYugaByteEnabled())
+			opt->yb_publication_names = data->publication_names;
+
 		/* Init publication state. */
 		data->publications = NIL;
 		publications_valid = false;
@@ -789,6 +812,10 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 		set_schema_sent_in_streamed_txn(relentry, topxid);
 	else
 		relentry->schema_sent = true;
+
+	if (IsYugaByteEnabled())
+		elog(DEBUG1, "Sent the RELATION message for table_id: %d",
+			 RelationGetRelid(relation));
 }
 
 /*
@@ -1618,7 +1645,102 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			logicalrep_write_update(ctx->out, xid, targetrel, old_slot,
 									new_slot, data->binary, relentry->columns,
-									relentry->include_gencols_type);
+									relentry->include_gencols_type,
+									NULL, NULL);
+			/*
+			 * YB_TODO_PG19MERGE: PG commit da324d6cd45bbbcc1682cc2fcbc4f575281916af
+			 * refactored this function. Port YB logic, fix logicalrep_write_update
+			 * call above.
+			 */
+#if 0
+			if (change->data.tp.oldtuple)
+			{
+				old_slot = relentry->old_slot;
+				ExecStoreHeapTuple(&change->data.tp.oldtuple->tuple,
+								   old_slot, false);
+			}
+
+			new_slot = relentry->new_slot;
+			ExecStoreHeapTuple(&change->data.tp.newtuple->tuple,
+							   new_slot, false);
+
+			/* Switch relation if publishing via root. */
+			if (relentry->publish_as_relid != RelationGetRelid(relation))
+			{
+				Assert(relation->rd_rel->relispartition);
+				ancestor = RelationIdGetRelation(relentry->publish_as_relid);
+				targetrel = ancestor;
+				/* Convert tuples if needed. */
+				if (relentry->attrmap)
+				{
+					TupleDesc	tupdesc = RelationGetDescr(targetrel);
+
+					if (old_slot)
+						old_slot = execute_attr_map_slot(relentry->attrmap,
+														 old_slot,
+														 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+
+					new_slot = execute_attr_map_slot(relentry->attrmap,
+													 new_slot,
+													 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+				}
+			}
+
+			/* Check row filter */
+			if (!pgoutput_row_filter(targetrel, old_slot, &new_slot,
+									 relentry, &action))
+				break;
+
+			/* Send BEGIN if we haven't yet */
+			if (txndata && !txndata->sent_begin_txn)
+				pgoutput_send_begin(ctx, txn);
+
+			maybe_send_schema(ctx, change, relation, relentry);
+
+			bool	   *yb_old_is_omitted = NULL;
+			bool	   *yb_new_is_omitted = NULL;
+
+			if (IsYugaByteEnabled() && yb_is_yboutput_mode)
+			{
+				yb_old_is_omitted =
+					change->data.tp.oldtuple ?
+					change->data.tp.oldtuple->yb_is_omitted :
+					NULL;
+
+				yb_new_is_omitted = change->data.tp.newtuple->yb_is_omitted;
+			}
+
+			OutputPluginPrepareWrite(ctx, true);
+
+			/*
+			 * Updates could be transformed to inserts or deletes based on the
+			 * results of the row filter for old and new tuple.
+			 */
+			switch (action)
+			{
+				case REORDER_BUFFER_CHANGE_INSERT:
+					logicalrep_write_insert(ctx->out, xid, targetrel,
+											new_slot, data->binary,
+											relentry->columns);
+					break;
+				case REORDER_BUFFER_CHANGE_UPDATE:
+					logicalrep_write_update(ctx->out, xid, targetrel,
+											old_slot, new_slot, data->binary,
+											relentry->columns,
+											yb_old_is_omitted,
+											yb_new_is_omitted);
+					break;
+				case REORDER_BUFFER_CHANGE_DELETE:
+					logicalrep_write_delete(ctx->out, xid, targetrel,
+											old_slot, data->binary,
+											relentry->columns);
+					break;
+				default:
+					Assert(false);
+			}
+
+			OutputPluginWrite(ctx, true);
+#endif
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			logicalrep_write_delete(ctx->out, xid, targetrel, old_slot,
@@ -1788,6 +1910,14 @@ static void
 pgoutput_shutdown(LogicalDecodingContext *ctx)
 {
 	pgoutput_memory_context_reset(NULL);
+}
+
+static void
+yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid)
+{
+	elog(DEBUG1, "yb_pgoutput_schema_change for relid: %d", relid);
+
+	rel_sync_cache_relation_cb(0 /* unused */ , relid);
 }
 
 /*
@@ -2518,4 +2648,10 @@ send_repl_origin(LogicalDecodingContext *ctx, ReplOriginId origin_id,
 			logicalrep_write_origin(ctx->out, origin, origin_lsn);
 		}
 	}
+}
+
+static void
+yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity)
+{
+	yb_is_yboutput_mode = support_yb_specific_replica_identity;
 }

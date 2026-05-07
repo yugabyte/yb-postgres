@@ -91,6 +91,13 @@ printMixedStruct(const struct config_generic *structToPrint)
 				   structToPrint->_int.max);
 			break;
 
+		case PGC_OID:
+			printf("OID\t%d\t%d\t%d\t",
+				   structToPrint->oid.reset_val,
+				   structToPrint->oid.min,
+				   structToPrint->oid.max);
+			break;
+
 		case PGC_REAL:
 			printf("REAL\t%g\t%g\t%g\t",
 				   structToPrint->_real.reset_val,

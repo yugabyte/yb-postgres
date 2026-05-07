@@ -56,6 +56,9 @@
 #include <shlwapi.h>
 #endif
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* Error triggered for locale-sensitive subroutines */
 #define		PGLOCALE_SUPPORT_ERROR(provider) \
 	elog(ERROR, "unsupported collprovider for %s: %c", __func__, provider)
@@ -1125,8 +1128,108 @@ create_pg_locale(Oid collid, MemoryContext context)
 }
 
 /*
- * Initialize default_locale with database locale settings.
+ * YB_TODO_PG19MERGE: PG commits 06421b08436414b42cd169501005f15adee986f1 and
+ * 51edc4ca54f826cfac012c7306eee479f07a5dc7 removed lc_collate_is_c and
+ * lc_ctype_is_c.
  */
+#if 0
+bool
+lc_collate_is_c(Oid collation)
+{
+	/*
+	 * If we're asked about "collation 0", return false, so that the code will
+	 * go into the non-C path and report that the collation is bogus.
+	 */
+	if (!OidIsValid(collation))
+		return false;
+
+	/*
+	 * At tserver side (for YB expression pushdown) YBCPgIsYugaByteEnabled()
+	 * is false. We assert at PG side before default collation is resolved,
+	 * only C collation is possible (PG 15 has made all catalog tables with
+	 * collation aware columns to all have C collation.
+	 */
+	Assert(!YBCPgIsYugaByteEnabled() || yb_default_collation_resolved || collation == C_COLLATION_OID);
+
+	/*
+	 * If we're asked about the default collation, we have to inquire of the C
+	 * library.  Cache the result so we only have to compute it once.
+	 */
+	if (collation == DEFAULT_COLLATION_OID)
+	{
+		static YB_THREAD_LOCAL int result = -1;
+		char	   *localeptr;
+
+		if (default_locale.provider == COLLPROVIDER_ICU)
+			return false;
+
+		if (result >= 0)
+			return (bool) result;
+		localeptr = setlocale(LC_COLLATE, NULL);
+		if (!localeptr)
+			elog(ERROR, "invalid LC_COLLATE setting");
+
+		if (strcmp(localeptr, "C") == 0)
+			result = true;
+		else if (strcmp(localeptr, "POSIX") == 0)
+			result = true;
+		else
+			result = false;
+		return (bool) result;
+	}
+
+	/*
+	 * If we're asked about the built-in C/POSIX collations, we know that.
+	 */
+	if (collation == C_COLLATION_OID ||
+		collation == POSIX_COLLATION_OID)
+		return true;
+
+	/*
+	 * Otherwise, we have to consult pg_collation, but we cache that.
+	 */
+	return (lookup_collation_cache(collation, true))->collate_is_c;
+}
+
+bool
+lc_ctype_is_c(Oid collation)
+{
+	if (!OidIsValid(collation))
+		return false;
+
+	if (collation == DEFAULT_COLLATION_OID)
+	{
+		static YB_THREAD_LOCAL int result = -1;
+		char	   *localeptr;
+
+		if (default_locale.provider == COLLPROVIDER_ICU)
+			return false;
+
+		if (result >= 0)
+			return (bool) result;
+		localeptr = setlocale(LC_CTYPE, NULL);
+		if (!localeptr)
+			elog(ERROR, "invalid LC_CTYPE setting");
+
+		if (strcmp(localeptr, "C") == 0)
+			result = true;
+		else if (strcmp(localeptr, "POSIX") == 0)
+			result = true;
+		else
+			result = false;
+		return (bool) result;
+	}
+
+	if (collation == C_COLLATION_OID ||
+		collation == POSIX_COLLATION_OID)
+		return true;
+
+	return (lookup_collation_cache(collation, true))->ctype_is_c;
+}
+
+struct pg_locale_struct default_locale;
+#endif
+
 void
 init_database_collation(void)
 {
@@ -1222,6 +1325,13 @@ pg_newlocale_from_collation(Oid collid)
 	if (!found)
 	{
 		/*
+		 * YB_TODO_PG19MERGE: PG19 moved per-provider locale construction into
+		 * create_pg_locale / create_pg_locale_libc / create_pg_locale_icu.
+		 * Port the YB YbCheckUnsupportedLibcLocale(collcollate) /
+		 * YbCheckUnsupportedLibcLocale(collctype) calls.
+		 */
+
+		/*
 		 * Make sure cache entry is marked invalid, in case we fail before
 		 * setting things.
 		 */
@@ -1257,6 +1367,27 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	else if (collprovider == COLLPROVIDER_LIBC)
 		collversion = get_collation_actual_version_libc(collcollate);
 
+	/* MacOS specific YB change to make unit test results stable. */
+	if (IsYugaByteEnabled())
+	{
+#ifdef __APPLE__
+		if (!collversion &&
+			yb_test_collation &&
+			collprovider == COLLPROVIDER_LIBC &&
+			pg_strcasecmp("C", collcollate) != 0 &&
+			pg_strncasecmp("C.", collcollate, 2) != 0 &&
+			pg_strcasecmp("POSIX", collcollate) != 0)
+			collversion = "2.28";
+#endif
+	}
+
+	if (yb_test_collation)
+
+		/*
+		 * Make unit test output stable across different OS types and
+		 * versions.
+		 */
+		return collversion ? "yb-test-2.28" : NULL;
 	return collversion;
 }
 

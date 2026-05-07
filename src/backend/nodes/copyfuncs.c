@@ -18,6 +18,18 @@
 #include "miscadmin.h"
 #include "utils/datum.h"
 
+/* YB includes */
+#include "nodes/ybbitmatrix.h"
+
+/*
+ * YB_TODO_PG19MERGE: upstream PG commit 964d01ae90c314eb31132c2e7712d5d9fc237331
+ * auto-generates node copy functions from struct definitions in header files.
+ * All manually-written YB copy functions have been removed in favor of
+ * auto-generation. Adding a todo for a more thorough audit of all the changes.
+ * Kept YbUpdateAffectedEntities custom copy function due to
+ * YbCopyBitMatrix. See also readfuncs.c, outfuncs.c, equalfuncs.c.
+ */
+
 
 /*
  * Macros to simplify copying of different kinds of fields.  Use these
@@ -166,6 +178,45 @@ _copyBitmapset(const Bitmapset *from)
 	return bms_copy(from);
 }
 
+/* YB: custom copy for YbUpdateAffectedEntities due to YbCopyBitMatrix */
+static YbUpdateAffectedEntities *
+_copyYbUpdateAffectedEntities(const YbUpdateAffectedEntities *from)
+{
+	YbUpdateAffectedEntities *newnode = makeNode(YbUpdateAffectedEntities);
+
+	COPY_POINTER_FIELD(entity_list, from->matrix.ncols * sizeof(struct YbUpdateEntity));
+	COPY_POINTER_FIELD(col_info_list, from->matrix.nrows * sizeof(struct YbUpdateColInfo));
+	YbCopyBitMatrix(&newnode->matrix, &from->matrix);
+
+	return newnode;
+}
+
+/* YB: custom copy for YbBatchedNestLoop due to pointer arrays needing deep copy */
+static YbBatchedNestLoop *
+_copyYbBatchedNestLoop(const YbBatchedNestLoop *from)
+{
+	YbBatchedNestLoop *newnode = makeNode(YbBatchedNestLoop);
+
+	CopyJoinFields((const Join *) from, (Join *) newnode);
+	COPY_NODE_FIELD(nl.nestParams);
+	COPY_SCALAR_FIELD(num_hashClauseInfos);
+	if (from->num_hashClauseInfos > 0)
+		COPY_POINTER_FIELD(hashClauseInfos,
+						   from->num_hashClauseInfos * sizeof(YbBNLHashClauseInfo));
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].outerParamExpr =
+			(Expr *) copyObject(from->hashClauseInfos[i].outerParamExpr);
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].orig_expr =
+			(Expr *) copyObject(from->hashClauseInfos[i].orig_expr);
+	COPY_SCALAR_FIELD(numSortCols);
+	COPY_POINTER_FIELD(sortColIdx, from->numSortCols * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(sortOperators, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(collations, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(nullsFirst, from->numSortCols * sizeof(bool));
+
+	return newnode;
+}
 
 /*
  * copyObjectImpl -- implementation of copyObject(); see nodes/nodes.h

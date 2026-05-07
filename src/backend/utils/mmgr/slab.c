@@ -372,6 +372,8 @@ SlabContextCreate(MemoryContext parent,
 						   name)));
 	}
 
+	YbPgMemAddConsumption(headerSize);
+
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
 	 * we'd leak the header if we ereport in this stretch.
@@ -480,7 +482,10 @@ SlabReset(MemoryContext context)
 			/* As in aset.c, free block-header vchunks explicitly */
 			VALGRIND_MEMPOOL_FREE(slab, block);
 
+			size_t		freed_sz = slab->blockSize;
+
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
 			context->mem_allocated -= slab->blockSize;
 		}
 	}
@@ -511,8 +516,11 @@ SlabDelete(MemoryContext context)
 	/* Destroy the vpool -- see notes in aset.c */
 	VALGRIND_DESTROY_MEMPOOL(context);
 
+	size_t		freed_sz = ((SlabContext *) context)->headerSize;
+
 	/* And free the context header */
 	free(context);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -595,6 +603,8 @@ SlabAllocFromNewBlock(MemoryContext context, Size size, int flags)
 
 		/* Make a vchunk covering the new block's header */
 		VALGRIND_MEMPOOL_ALLOC(slab, block, Slab_BLOCKHDRSZ);
+
+		YbPgMemAddConsumption(slab->blockSize);
 
 		block->slab = slab;
 		context->mem_allocated += slab->blockSize;
@@ -835,7 +845,10 @@ SlabFree(void *pointer)
 			/* As in aset.c, free block-header vchunks explicitly */
 			VALGRIND_MEMPOOL_FREE(slab, block);
 
+			size_t		freed_sz = slab->blockSize;
+
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
 			slab->header.mem_allocated -= slab->blockSize;
 		}
 

@@ -58,6 +58,9 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* GUC variables */
 int			DeadlockTimeout = 1000;
 int			StatementTimeout = 0;
@@ -70,12 +73,19 @@ bool		log_lock_waits = true;
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
 
+int			RetryMaxBackoffMsecs;
+int			RetryMinBackoffMsecs;
+double		RetryBackoffMultiplier;
+int			yb_max_query_layer_retries;
+
 /* Pointers to shared-memory structures */
 PROC_HDR   *ProcGlobal = NULL;
 static void *AllProcsShmemPtr;
 static void *FastPathLockArrayShmemPtr;
 NON_EXEC_STATIC PGPROC *AuxiliaryProcs = NULL;
 PGPROC	   *PreparedXactProcs = NULL;
+PGPROC	   *KilledProcToClean = NULL;
+int		   *yb_too_many_conn = NULL;
 
 static void ProcGlobalShmemRequest(void *arg);
 static void ProcGlobalShmemInit(void *arg);
@@ -96,7 +106,6 @@ static void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static DeadLockState CheckDeadLock(void);
-
 
 /*
  * Calculate shared-memory space needed by Fast-Path locks.
@@ -119,6 +128,9 @@ CalculateFastPathLockShmemSize(void)
 
 	Assert(TotalProcs > 0);
 	Assert(size > 0);
+
+	/* yb_too_many_conn metric */
+	size = add_size(size, sizeof(int));
 
 	return size;
 }
@@ -322,6 +334,7 @@ ProcGlobalShmemInit(void *arg)
 			proc->sem = PGSemaphoreCreate();
 			InitSharedLatch(&(proc->procLatch));
 			LWLockInitialize(&(proc->fpInfoLock), LWTRANCHE_LOCK_FASTPATH);
+			LWLockInitialize(&(proc->yb_ash_metadata_lock), LWTRANCHE_YB_ASH_METADATA);
 		}
 
 		/*
@@ -383,6 +396,9 @@ ProcGlobalShmemInit(void *arg)
 	 */
 	AuxiliaryProcs = &procs[MaxBackends];
 	PreparedXactProcs = &procs[FIRST_PREPARED_XACT_PROC_NUMBER];
+
+	yb_too_many_conn = (int *) ShmemAlloc(sizeof(int));
+	(*yb_too_many_conn) = 0;
 }
 
 /*
@@ -449,6 +465,10 @@ InitProcess(void)
 		 * in the autovacuum case?
 		 */
 		SpinLockRelease(&ProcGlobal->freeProcsLock);
+
+		/* YB: increment rejection counter */
+		(*yb_too_many_conn)++;
+
 		if (AmWalSenderProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
@@ -465,6 +485,15 @@ InitProcess(void)
 	 * the case, it would get returned to the wrong list.
 	 */
 	Assert(MyProc->procgloballist == procgloballist);
+
+	/*
+	* YB: If the process is killed before this point, it does not have a pid
+	* set. The postmaster will not be able to identify the corresponding
+	* MyProc, so it will restart anyways.
+	*/
+	MyProc->ybInitializationCompleted = false;
+	MyProc->ybTerminationStarted = false;
+	MyProc->ybEnteredCriticalSection = false;
 
 	/*
 	 * Initialize all fields of MyProc, except for those previously
@@ -531,6 +560,24 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PROC_NUMBER);
 
+	MyProc->ybLWLockAcquired = false;
+	MyProc->ybSpinLocksAcquired = 0;
+
+	MemSet(MyProc->yb_ash_metadata.root_request_id, 0,
+		   sizeof(MyProc->yb_ash_metadata.root_request_id));
+	/*
+	 * YB: TODO(asaha): Update the query_id for catalog calls in circular
+	 * buffer once it's calculated
+	 */
+	MyProc->yb_ash_metadata.qp =
+		(YbcAshQueryPlanPair){YbAshGetConstQueryId(), YB_ASH_DEFAULT_PLAN_ID};
+	MemSet(MyProc->yb_ash_metadata.client_addr, 0,
+		   sizeof(MyProc->yb_ash_metadata.client_addr));
+	MyProc->yb_ash_metadata.client_port = 0;
+	MyProc->yb_ash_metadata.addr_family = AF_UNSPEC;
+	MyProc->yb_ash_metadata.database_id = 0;
+	MyProc->yb_is_ash_metadata_set = false;
+
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
 	 * on it.  That allows us to repoint the process latch, which so far
@@ -540,7 +587,10 @@ InitProcess(void)
 	SwitchToSharedLatch();
 
 	/* now that we have a proc, report wait events to shared memory */
-	pgstat_set_wait_event_storage(&MyProc->wait_event_info);
+	if (YBIsEnabledInPostgresEnvVar())
+		yb_pgstat_set_wait_event_storage(MyProc);
+	else
+		pgstat_set_wait_event_storage(&MyProc->wait_event_info);
 
 	/*
 	 * We might be reusing a semaphore that belonged to a failed process. So
@@ -919,21 +969,27 @@ RemoveProcFromArray(int code, Datum arg)
 /*
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
+ *
+ * If you are going to edit this, take a look at postmaster.c:reaper as well.
+ * That function handles as much as this as possible but from the perspective
+ * of the parent of the terminated child, to handle cases where the child was
+ * not able to clean itself up.
  */
 static void
 ProcKill(int code, Datum arg)
 {
 	PGPROC	   *proc;
-	dlist_head *procgloballist;
 
 	Assert(MyProc != NULL);
+
+	MyProc->ybTerminationStarted = true;
 
 	/* not safe if forked by system(), etc. */
 	if (MyProc->pid != (int) getpid())
 		elog(PANIC, "ProcKill() called in child process");
 
 	/* Make sure we're out of the sync rep lists */
-	SyncRepCleanupAtProcExit();
+	SyncRepCleanupAtProcExit(MyProc);
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -960,37 +1016,8 @@ ProcKill(int code, Datum arg)
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
 
-	/*
-	 * Detach from any lock group of which we are a member.  If the leader
-	 * exits before all other group members, its PGPROC will remain allocated
-	 * until the last group process exits; that process must return the
-	 * leader's PGPROC to the appropriate list.
-	 */
 	if (MyProc->lockGroupLeader != NULL)
-	{
-		PGPROC	   *leader = MyProc->lockGroupLeader;
-		LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
-
-		LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
-		Assert(!dlist_is_empty(&leader->lockGroupMembers));
-		dlist_delete(&MyProc->lockGroupLink);
-		if (dlist_is_empty(&leader->lockGroupMembers))
-		{
-			leader->lockGroupLeader = NULL;
-			if (leader != MyProc)
-			{
-				procgloballist = leader->procgloballist;
-
-				/* Leader exited first; return its PGPROC. */
-				SpinLockAcquire(&ProcGlobal->freeProcsLock);
-				dlist_push_head(procgloballist, &leader->freeProcsLink);
-				SpinLockRelease(&ProcGlobal->freeProcsLock);
-			}
-		}
-		else if (leader != MyProc)
-			MyProc->lockGroupLeader = NULL;
-		LWLockRelease(leader_lwlock);
-	}
+		YbRemoveLockGroupLeader(MyProc);
 
 	/*
 	 * Reset MyLatch to the process local one.  This is so that signal
@@ -1002,7 +1029,10 @@ ProcKill(int code, Datum arg)
 	 * After that clear MyProc and disown the shared latch.
 	 */
 	SwitchBackToLocalLatch();
-	pgstat_reset_wait_event_storage();
+	if (YBIsEnabledInPostgresEnvVar())
+		yb_pgstat_reset_wait_event_storage();
+	else
+		pgstat_reset_wait_event_storage();
 
 	proc = MyProc;
 	MyProc = NULL;
@@ -1014,7 +1044,51 @@ ProcKill(int code, Datum arg)
 	proc->vxid.procNumber = INVALID_PROC_NUMBER;
 	proc->vxid.lxid = InvalidTransactionId;
 
-	procgloballist = proc->procgloballist;
+	if (IsYugaByteEnabled())
+		YBOnPostgresBackendShutdown();
+
+	YbReleaseProcToFreeList(proc);
+}
+
+/*
+ * Detach from any lock group of which we are a member.  If the leader
+ * exits before all other group members, its PGPROC will remain allocated
+ * until the last group process exits; that process must return the
+ * leader's PGPROC to the appropriate list.
+ */
+void
+YbRemoveLockGroupLeader(PGPROC *proc)
+{
+	dlist_head *procgloballist;
+	PGPROC	   *leader = proc->lockGroupLeader;
+	LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
+
+	LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
+	Assert(!dlist_is_empty(&leader->lockGroupMembers));
+	dlist_delete(&proc->lockGroupLink);
+	if (dlist_is_empty(&leader->lockGroupMembers))
+	{
+		leader->lockGroupLeader = NULL;
+		if (leader != proc)
+		{
+			procgloballist = leader->procgloballist;
+
+			/* Leader exited first; return its PGPROC. */
+			SpinLockAcquire(&ProcGlobal->freeProcsLock);
+			dlist_push_head(procgloballist, &leader->freeProcsLink);
+			SpinLockRelease(&ProcGlobal->freeProcsLock);
+		}
+	}
+	else if (leader != proc)
+		proc->lockGroupLeader = NULL;
+	LWLockRelease(leader_lwlock);
+}
+
+void
+YbReleaseProcToFreeList(PGPROC *proc)
+{
+	dlist_head *procgloballist = proc->procgloballist;
+
 	SpinLockAcquire(&ProcGlobal->freeProcsLock);
 
 	/*

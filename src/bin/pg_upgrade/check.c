@@ -17,6 +17,9 @@
 #include "pg_upgrade.h"
 #include "common/unicode_version.h"
 
+/* YB includes */
+#include "lib/stringinfo.h"
+
 static void check_new_cluster_is_empty(void);
 static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
@@ -38,6 +41,26 @@ static void check_old_cluster_for_valid_slots(void);
 static void check_old_cluster_subscription_state(void);
 static void check_old_cluster_global_names(ClusterInfo *cluster);
 
+/* YB functions */
+static void yb_check_upgrade_compatibility_guc(PGconn *old_cluster_conn);
+static void yb_check_system_databases_exist(PGconn *old_cluster_conn);
+static void yb_check_user_attributes(PGconn *old_cluster_conn,
+									 const char *user_name,
+									 const char **role_attrs);
+static void yb_check_yugabyte_user(PGconn *old_cluster_conn);
+static void yb_check_old_cluster_user(PGconn *old_cluster_conn);
+static void yb_check_invalid_indexes();
+static void yb_check_installed_extensions();
+static void yb_check_pgcrypto_schema();
+static void yb_check_yb_role_prefix();
+
+#define YB_SUPERUSER  "yb_superuser"
+
+/*
+ * YB_TODO_PG19MERGE: PG did some refactoring and added new checks. Might have to
+ * change pg_fatals, fprintf to yb_fatals, yb_fprintf_and_log. Also see changes
+ * in version.c.
+ */
 /*
  * DataTypesUsageChecks - definitions of data type checks for the old cluster
  * in order to determine if an upgrade can be performed.  See the comment on
@@ -594,8 +617,26 @@ check_and_dump_old_cluster(void)
 {
 	/* -- OLD -- */
 
-	if (!user_opts.live_check)
+	if (!is_yugabyte_enabled() && !user_opts.live_check)
 		start_postmaster(&old_cluster, true);
+
+	if (is_yugabyte_enabled())
+	{
+		PGconn	   *old_cluster_conn = connectToServer(&old_cluster, "template1");
+
+		/*
+		 * --check can be run any time before the upgrade. Upgrade Compatibility
+		 * GUC is only required to be set during the actual upgrade.
+		 */
+		if (!user_opts.check)
+			yb_check_upgrade_compatibility_guc(old_cluster_conn);
+
+		yb_check_old_cluster_user(old_cluster_conn);
+		yb_check_yugabyte_user(old_cluster_conn);
+		yb_check_system_databases_exist(old_cluster_conn);
+
+		PQfinish(old_cluster_conn);
+	}
 
 	/*
 	 * First check that all databases allow connections since we'll otherwise
@@ -622,7 +663,10 @@ check_and_dump_old_cluster(void)
 	 */
 	get_db_rel_and_slot_infos(&old_cluster);
 
-	init_tablespaces();
+	/* YB: Enable these checks and other functions to initialize new node */
+	if (!is_yugabyte_enabled())
+		/* Yugabyte does not support tablespace directories */
+		init_tablespaces();
 
 	get_loadable_libraries();
 
@@ -630,9 +674,15 @@ check_and_dump_old_cluster(void)
 	/*
 	 * Check for various failure cases
 	 */
-	check_is_install_user(&old_cluster);
-	check_for_prepared_transactions(&old_cluster);
-	check_for_isn_and_int8_passing_mismatch(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* In Yugabyte this is handled by yb_check_yugabyte_user */
+		check_is_install_user(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* Yugabyte does not support prepared transactions, see #1125 */
+		check_for_prepared_transactions(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* YB: See comment above call to check_cluster_compatibility */
+		check_for_isn_and_int8_passing_mismatch(&old_cluster);
 
 	if (GET_MAJOR_VERSION(old_cluster.major_version) >= 1700)
 	{
@@ -665,7 +715,11 @@ check_and_dump_old_cluster(void)
 	 * because the user-defined functions used by the encoding conversions
 	 * need to be changed to match the new signature.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1300)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 1300)
+		/*
+		 * CREATE CONVERSION is not supported by YB,
+		 * cannot have user-defined encoding conversions.
+		 */
 		check_for_user_defined_encoding_conversions(&old_cluster);
 
 	/*
@@ -685,8 +739,9 @@ check_and_dump_old_cluster(void)
 	/*
 	 * Pre-PG 12 allowed tables to be declared WITH OIDS, which is not
 	 * supported anymore. Verify there are none, iff applicable.
+	 * In Yugabyte, this was not allowed.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1100)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 1100)
 		check_for_tables_with_oids(&old_cluster);
 
 	/*
@@ -716,15 +771,24 @@ check_and_dump_old_cluster(void)
 	 * Pre-PG 10 allowed tables with 'unknown' type columns and non WAL logged
 	 * hash indexes
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 906)
+	/* These checks are irrelevant for Yugabyte (Pre-PG11 checks) */
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 906)
 	{
 		if (user_opts.check)
 			old_9_6_invalidate_hash_indexes(&old_cluster, true);
 	}
 
 	/* 9.5 and below should not have roles starting with pg_ */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 905)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 905)
 		check_for_pg_role_prefix(&old_cluster);
+
+	yb_check_invalid_indexes();
+	yb_check_installed_extensions();
+	yb_check_pgcrypto_schema();
+	yb_check_yb_role_prefix();
+
+	if (yb_has_check_fatal)
+		pg_fatal("\n");
 
 	/*
 	 * While not a check option, we do this now because this is the only time
@@ -733,7 +797,7 @@ check_and_dump_old_cluster(void)
 	if (!user_opts.check)
 		generate_old_dump();
 
-	if (!user_opts.live_check)
+	if (!is_yugabyte_enabled() && !user_opts.live_check)
 		stop_postmaster(false);
 }
 
@@ -932,6 +996,24 @@ check_cluster_versions(void)
 	check_ok();
 }
 
+void
+yb_check_cluster_versions(void)
+{
+	if (!user_opts.check)
+		return;
+
+	prep_status("Checking cluster versions");
+
+	/* cluster versions should already have been obtained */
+	Assert(old_cluster.major_version != 0);
+
+	if (GET_MAJOR_VERSION(old_cluster.major_version) > 1100)
+		pg_fatal("This version of the utility can only be used for checking "
+				 "YSQL version 11. The cluster is currently on YSQL version %s\n",
+				 old_cluster.major_version_str);
+
+	check_ok();
+}
 
 void
 check_cluster_compatibility(void)
@@ -1220,7 +1302,7 @@ check_for_connection_status(ClusterInfo *cluster)
 				if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
 					pg_fatal("could not open file \"%s\": %m", output_path);
 
-				fprintf(script, "%s\n", datname);
+				yb_fprintf_and_log(script, "%s\n", datname);
 			}
 		}
 	}
@@ -1232,8 +1314,9 @@ check_for_connection_status(ClusterInfo *cluster)
 	if (script)
 	{
 		fclose(script);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("All non-template0 databases must allow connections, i.e. their\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("All non-template0 databases must allow connections, i.e. their\n"
 				 "pg_database.datallowconn must be true and pg_database.datconnlimit\n"
 				 "must not be -2.  Your installation contains non-template0 databases\n"
 				 "which cannot be connected to.  Consider allowing connection for all\n"
@@ -1501,8 +1584,9 @@ check_for_user_defined_postfix_ops(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains user-defined postfix operators, which are not\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains user-defined postfix operators, which are not\n"
 				 "supported anymore.  Consider dropping the postfix operators and replacing\n"
 				 "them with prefix operators or function calls.\n"
 				 "A list of user-defined postfix operators is in the file:\n"
@@ -1626,8 +1710,9 @@ check_for_incompatible_polymorphics(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains user-defined objects that refer to internal\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains user-defined objects that refer to internal\n"
 				 "polymorphic functions with arguments of type \"anyarray\" or \"anyelement\".\n"
 				 "These user-defined objects must be dropped before upgrading and restored\n"
 				 "afterwards, changing them to refer to the new corresponding functions with\n"
@@ -1783,7 +1868,6 @@ check_for_not_null_inheritance(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
 		pg_fatal("Your installation contains inconsistent NOT NULL constraints.\n"
 				 "If the parent column(s) are NOT NULL, then the child column must\n"
 				 "also be marked NOT NULL, or the upgrade will fail.\n"
@@ -1858,7 +1942,6 @@ check_for_gist_inet_ops(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
 		pg_fatal("Your installation contains indexes that use btree_gist's\n"
 				 "gist_inet_ops or gist_cidr_ops opclasses,\n"
 				 "which cannot be binary-upgraded.  Replace them with indexes\n"
@@ -2640,6 +2723,464 @@ check_old_cluster_global_names(ClusterInfo *cluster)
 				 "rename these names with valid names. \n"
 				 "To see all %d invalid object names, refer db_role_tablespace_invalid_names.txt file. \n"
 				 "    %s", count, output_path);
+	}
+	else
+		check_ok();
+}
+
+/*
+ * yb_check_upgrade_compatibility_guc()
+ *
+ * Make sure the yb_major_version_upgrade_compatibility GUC is set to the
+ * correct value.
+ */
+static void
+yb_check_upgrade_compatibility_guc(PGconn *old_cluster_conn)
+{
+	PGresult   *res;
+
+	prep_status("Checking expression pushdown is disabled");
+
+	res = executeQueryOrDie(old_cluster_conn, "SHOW yb_major_version_upgrade_compatibility");
+
+	if (strncmp(PQgetvalue(res, 0, 0), "11", 2))
+		pg_fatal("yb_major_version_upgrade_compatibility must be set to 11\n");
+
+	PQclear(res);
+
+	check_ok();
+}
+
+/*
+ * yb_check_system_databases_exist()
+ *
+ *	All the 3 system database should exist before upgrading
+ */
+static void
+yb_check_system_databases_exist(PGconn *old_cluster_conn)
+{
+	PGresult   *res;
+
+	prep_status("Checking for all 3 system databases");
+
+	res = executeQueryOrDie(old_cluster_conn,
+							"VALUES ('template0'), ('template1'), ('yugabyte') EXCEPT SELECT datname FROM pg_database;");
+
+	if (PQntuples(res) != 0)
+		pg_fatal("Missing system database '%s'\n", PQgetvalue(res, 0, 0));
+
+	PQclear(res);
+
+	check_ok();
+}
+
+/*
+ * yb_check_user_attributes()
+ *
+ *	Make sure the user have the required attributes.
+ */
+static void
+yb_check_user_attributes(PGconn *old_cluster_conn, const char *user_name,
+						 const char **role_attrs)
+{
+	PQExpBufferData buf;
+	PGresult   *res;
+	const char **role_attr;
+	bool		first_attribute = true;
+
+	initPQExpBuffer(&buf);
+	for (role_attr = role_attrs; *role_attr != NULL; role_attr++)
+	{
+		if (!first_attribute)
+			appendPQExpBufferStr(&buf, ", ");
+		first_attribute = false;
+		appendPQExpBufferStr(&buf, *role_attr);
+	}
+
+	res = executeQueryOrDie(old_cluster_conn,
+							"SELECT %s FROM pg_catalog.pg_roles WHERE rolname = '%s'",
+							buf.data, user_name);
+
+	if (PQntuples(res) != 1)
+		pg_fatal("The '%s' user is missing\n", user_name);
+
+	for (role_attr = role_attrs; *role_attr != NULL; role_attr++)
+	{
+		if (strcmp(PQgetvalue(res, 0, PQfnumber(res, *role_attr)), "f") == 0)
+			pg_fatal("The '%s' user is missing the '%s' attribute\n", user_name,
+					 *role_attr);
+	}
+
+	termPQExpBuffer(&buf);
+	PQclear(res);
+}
+
+/*
+ * yb_check_yugabyte_user()
+ *
+ *	Make sure yugabyte user has the required attributes.
+ */
+static void
+yb_check_yugabyte_user(PGconn *old_cluster_conn)
+{
+	static const char *role_attrs[] = {
+		"rolsuper",
+		"rolinherit",
+		"rolcreaterole",
+		"rolcreatedb",
+		"rolcanlogin",
+		"rolreplication",
+		"rolbypassrls",
+		NULL,
+	};
+
+	prep_status("Checking attributes of the 'yugabyte' user");
+	yb_check_user_attributes(old_cluster_conn, "yugabyte", role_attrs);
+	check_ok();
+}
+
+/*
+ * yb_check_old_cluster_user()
+ *
+ *	Make sure user used to dump the old cluster has required attributes.
+ */
+static void
+yb_check_old_cluster_user(PGconn *old_cluster_conn)
+{
+	static const char *role_attributes[] = {"rolsuper", "rolcanlogin", NULL};
+
+	/* yugabyte user is checked in yb_check_yugabyte_user */
+	if (strcmp(old_cluster.yb_user, "yugabyte") == 0)
+		return;
+
+	prep_status("Checking attributes of the '%s' user", old_cluster.yb_user);
+	yb_check_user_attributes(old_cluster_conn, old_cluster.yb_user,
+							 role_attributes);
+	check_ok();
+}
+
+static void
+yb_check_invalid_indexes()
+{
+	int			dbnum;
+	bool		found = false;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "invalid_indexes.txt");
+
+	prep_status("Checking for invalid indexes");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_schemaname;
+		int			i_indexname;
+		int			i_indexrelid;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/*
+		 * Query to find invalid indexes that would be excluded by pg_dump.
+		 * pg_dump includes indexes WHERE (indisvalid OR relkind='p') AND indisready
+		 * So we find the negation, which is:
+		 * (NOT indisvalid AND relkind!='p') OR NOT indisready
+		 */
+		res = executeQueryOrDie(conn,
+								"SELECT n.nspname AS schemaname, "
+								"       c.relname AS tablename, "
+								"       i.relname AS indexname, "
+								"       indexrelid "
+								"FROM pg_catalog.pg_index x "
+								"JOIN pg_catalog.pg_class c ON c.oid = x.indrelid "
+								"JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid "
+								"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+								"WHERE (NOT x.indisvalid AND c.relkind != 'p') OR NOT x.indisready "
+								"ORDER BY n.nspname, c.relname, i.relname");
+
+		ntups = PQntuples(res);
+		i_schemaname = PQfnumber(res, "schemaname");
+		i_indexname = PQfnumber(res, "indexname");
+		i_indexrelid = PQfnumber(res, "indexrelid");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			const char *schemaname = PQgetvalue(res, rowno, i_schemaname);
+			const char *indexname = PQgetvalue(res, rowno, i_indexname);
+
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s\n", output_path,
+						 strerror(errno));
+			if (!db_used)
+			{
+				yb_fprintf_and_log(script, "In database: %s\n",
+								   active_db->db_name);
+				db_used = true;
+			}
+			yb_fprintf_and_log(script, "  %s.%s (oid=%s)\n",
+							   PQgetvalue(res, rowno, i_schemaname),
+							   PQgetvalue(res, rowno, i_indexname),
+							   PQgetvalue(res, rowno, i_indexrelid));
+			yb_fprintf_and_log(script, "    \\c %s\n", active_db->db_name);
+			yb_fprintf_and_log(script, "    DROP INDEX %s.%s;\n", schemaname, indexname);
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains invalid indexes that must be fixed\n"
+				 "before upgrading. Invalid indexes are typically created when\n"
+				 "CREATE INDEX CONCURRENTLY fails or is interrupted. You can fix\n"
+				 "this by dropping the invalid indexes and recreating them if needed.\n"
+				 "To find invalid indexes, run\n"
+				 "  SELECT i.indexrelid::regclass FROM pg_index i\n"
+				 "  JOIN pg_class c ON c.oid = i.indrelid\n"
+				 "  WHERE (NOT i.indisvalid AND c.relkind != 'p') OR NOT i.indisready;\n"
+				 "in all databases.\n"
+				 "A list of invalid indexes and DROP commands is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+static void
+yb_check_installed_extensions()
+{
+	int			dbnum;
+	bool		found = false;
+	StringInfoData error_msg;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	initStringInfo(&error_msg);
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "unsupported_extensions.txt");
+
+	prep_status("Checking installed extensions");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_name;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/* Find installed extensions not in the allowed list */
+		res = executeQueryOrDie(conn,
+								"SELECT extname FROM pg_extension WHERE extname NOT IN "
+								"('auto_explain',"
+								"'file_fdw',"
+								"'fuzzystrmatch',"
+								"'hstore',"
+								"'passwordcheck',"
+								"'pgcrypto',"
+								"'pg_stat_statements',"
+								"'pg_trgm',"
+								"'postgres_fdw',"
+								"'autoinc',"
+								"'insert_username',"
+								"'moddatetime',"
+								"'refint',"
+								"'sslinfo',"
+								"'tablefunc',"
+								"'uuid-ossp',"
+								"'hypopg',"
+								"'orafce',"
+								"'pgaudit',"
+								"'pg_hint_plan',"
+								"'hll',"
+								"'pg_cron',"
+								"'pg_partman',"
+								"'plpgsql',"
+								"'anon',"
+								"'cube',"
+								"'earthdistance',"
+								"'yb_ycql_utils')");
+		ntups = PQntuples(res);
+		i_name = PQfnumber(res, "extname");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			const char *extension_name = PQgetvalue(res, rowno, i_name);
+
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s\n", output_path,
+						 strerror(errno));
+			if (!db_used)
+			{
+				yb_fprintf_and_log(script, "In database: %s\n",
+								   active_db->db_name);
+				db_used = true;
+			}
+			yb_fprintf_and_log(script, "  %s\n", extension_name);
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains extensions that are not compatible\n"
+				 "with YSQL major version upgrade. Please uninstall the extensions\n"
+				 "using DROP EXTENSION, and reinstall them after the upgrade. A list of\n"
+				 "extensions with problems is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+/*
+ * yb_check_pgcrypto_schema()
+ *
+ * Check that pgcrypto is not installed in the pg_catalog schema.
+ */
+static void
+yb_check_pgcrypto_schema()
+{
+	int			dbnum;
+	bool		found = false;
+
+	prep_status("Checking for extensions in conflicting schemas");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_extname;
+		int			i_nspname;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/* Find pgcrypto extension installed in pg_catalog schema */
+		res = executeQueryOrDie(conn,
+								"SELECT e.extname, n.nspname "
+								"FROM pg_extension e "
+								"JOIN pg_namespace n ON e.extnamespace = n.oid "
+								"WHERE e.extname = 'pgcrypto' "
+								"AND n.nspname = 'pg_catalog'");
+		ntups = PQntuples(res);
+		i_extname = PQfnumber(res, "extname");
+		i_nspname = PQfnumber(res, "nspname");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			found = true;
+			if (!db_used)
+			{
+				pg_log(PG_REPORT, "In database: %s\n", active_db->db_name);
+				db_used = true;
+			}
+			pg_log(PG_REPORT, "  %s installed in %s schema\n",
+					PQgetvalue(res, rowno, i_extname),
+					PQgetvalue(res, rowno, i_nspname));
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains the 'pgcrypto' extension in the\n"
+				"conflicting 'pg_catalog' schema. To proceed with the upgrade, please\n"
+				"uninstall the extension using DROP EXTENSION, and reinstall it into\n"
+				"a different schema (e.g. public).");
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+/*
+ * yb_check_for_yb_role_prefix()
+ *
+ * Check that no roles start with "yb_" prefix which is reserved for system use
+ */
+static void
+yb_check_yb_role_prefix()
+{
+	PGresult   *res;
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+	int			ntups;
+	int			i_rolname;
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
+	bool		found = false;
+
+	prep_status("Checking for roles starting with \"yb_\"");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "roles_with_yb_prefix.txt");
+
+	/*
+	 * Like in the PG code in this file, the query below hardcodes
+	 * FirstNormalObjectId as 16384 rather than using that C #define
+	 * in the query because, if that #define is ever changed, the cutoff we
+	 * want to use is the value used by old version servers, not that of
+	 * some future version.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT rolname "
+							"FROM pg_catalog.pg_roles "
+							"WHERE rolname ~ '^yb_' "
+							"AND oid >= 16384 "
+							"AND rolname != '%s' "
+							"ORDER BY rolname",
+							YB_SUPERUSER);
+	ntups = PQntuples(res);
+	i_rolname = PQfnumber(res, "rolname");
+
+	if (ntups > 0)
+	{
+		found = true;
+		if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+			pg_fatal("could not open file \"%s\": %s\n",
+					 output_path, strerror(errno));
+
+		yb_fprintf_and_log(script, "Roles with \"yb_\" prefix:\n");
+		for (int rowno = 0; rowno < ntups; rowno++)
+		{
+			yb_fprintf_and_log(script, "  %s\n",
+							   PQgetvalue(res, rowno, i_rolname));
+		}
+		fclose(script);
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+
+	if (found)
+	{
+		yb_fatal("Your installation contains roles starting with \"yb_\".\n"
+				 "The \"yb_\" prefix is reserved for system use and these roles must be\n"
+				 "dropped or renamed before upgrading. A list of the problematic roles\n"
+				 "is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
 	}
 	else
 		check_ok();

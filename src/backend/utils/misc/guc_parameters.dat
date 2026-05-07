@@ -784,7 +784,7 @@
 { name => 'default_toast_compression', type => 'enum', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Sets the default compression method for compressible values.',
   variable => 'default_toast_compression',
-  boot_val => 'DEFAULT_TOAST_COMPRESSION',
+  boot_val => 'TOAST_LZ4_COMPRESSION', # YB: change default
   options => 'default_toast_compression_options',
 },
 
@@ -799,6 +799,7 @@
   variable => 'DefaultXactIsoLevel',
   boot_val => 'XACT_READ_COMMITTED',
   options => 'isolation_level_options',
+  check_hook => 'check_yb_default_xact_isolation', # YB
 },
 
 { name => 'default_transaction_read_only', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
@@ -994,7 +995,7 @@
   short_desc => 'Enables partitionwise aggregation and grouping.',
   flags => 'GUC_EXPLAIN',
   variable => 'enable_partitionwise_aggregate',
-  boot_val => 'false',
+  boot_val => 'true', # YB: change default from false to true
 },
 
 { name => 'enable_partitionwise_join', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
@@ -1614,6 +1615,7 @@
   boot_val => '0',
   min => '0',
   max => 'INT_MAX',
+  assign_hook => 'YBCSetLockTimeout', # YB
 },
 
 { name => 'log_autoanalyze_min_duration', type => 'int', context => 'PGC_SIGHUP', group => 'LOGGING_WHAT',
@@ -1972,6 +1974,8 @@
   boot_val => '100',
   min => '1',
   max => 'MAX_BACKENDS',
+  check_hook => 'check_maxconnections',
+  show_hook => 'yb_show_maxconnections', # YB
 },
 
 { name => 'max_files_per_process', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_KERNEL',
@@ -2120,6 +2124,7 @@
   boot_val => '10',
   min => '0',
   max => 'MAX_BACKENDS /* XXX? */',
+  assign_hook => 'yb_assign_max_replication_slots', # YB
 },
 
 { name => 'max_slot_wal_keep_size', type => 'int', context => 'PGC_SIGHUP', group => 'REPLICATION_SENDING',
@@ -2320,7 +2325,7 @@
   short_desc => 'Sets the planner\'s estimate of the cost of starting up worker processes for parallel query.',
   flags => 'GUC_EXPLAIN',
   variable => 'parallel_setup_cost',
-  boot_val => 'DEFAULT_PARALLEL_SETUP_COST',
+  boot_val => 'YB_DEFAULT_PARALLEL_SETUP_COST', # YB: change default
   min => '0',
   max => 'DBL_MAX',
 },
@@ -2329,7 +2334,7 @@
   short_desc => 'Sets the planner\'s estimate of the cost of passing each tuple (row) from worker to leader backend.',
   flags => 'GUC_EXPLAIN',
   variable => 'parallel_tuple_cost',
-  boot_val => 'DEFAULT_PARALLEL_TUPLE_COST',
+  boot_val => 'YB_DEFAULT_PARALLEL_TUPLE_COST', # YB: change default
   min => '0',
   max => 'DBL_MAX',
 },
@@ -3053,7 +3058,7 @@
   long_desc => '-1 means no limit.',
   flags => 'GUC_UNIT_KB',
   variable => 'temp_file_limit',
-  boot_val => '-1',
+  boot_val => '1024 * 1024', # YB: change default from -1
   min => '-1',
   max => 'INT_MAX',
 },
@@ -3242,6 +3247,7 @@
   variable => 'XactDeferrable',
   boot_val => 'false',
   check_hook => 'check_transaction_deferrable',
+  assign_hook => 'assign_transaction_deferrable', # YB
 },
 
 { name => 'transaction_isolation', type => 'enum', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
@@ -3251,6 +3257,7 @@
   boot_val => 'XACT_READ_COMMITTED',
   options => 'isolation_level_options',
   check_hook => 'check_transaction_isolation',
+  assign_hook => 'yb_assign_XactIsoLevel', # YB
 },
 
 { name => 'transaction_read_only', type => 'bool', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
@@ -3259,6 +3266,7 @@
   variable => 'XactReadOnly',
   boot_val => 'false',
   check_hook => 'check_transaction_read_only',
+  assign_hook => 'assign_transaction_read_only', # YB
 },
 
 { name => 'transaction_timeout', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
@@ -3497,7 +3505,10 @@
 { name => 'wal_level', type => 'enum', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
   short_desc => 'Sets the level of information written to the WAL.',
   variable => 'wal_level',
-  boot_val => 'WAL_LEVEL_REPLICA',
+  # YB NOTE: wal_level is not applicable to YB. So for user experience,
+  # we set the default to logical, so that any logical replication
+  # client doesn't throw any errors based on the value of the wal_level.
+  boot_val => 'WAL_LEVEL_LOGICAL',
   options => 'wal_level_options',
 },
 
