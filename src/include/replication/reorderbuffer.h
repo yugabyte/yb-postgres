@@ -67,6 +67,11 @@ typedef enum ReorderBufferChangeType
 struct ReorderBufferTXN;
 
 /*
+ * YB_TODO_PG19MERGE: PG removed the struct ReorderBufferTupleBuf that had yb
+ * fields yb_is_omitted and yb_is_omitted_size
+ */
+
+/*
  * a single 'change', can be an insert (with one tuple), an update (old, new),
  * or a delete (old).
  *
@@ -104,6 +109,9 @@ typedef struct ReorderBufferChange
 			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
 			HeapTuple	newtuple;
+
+			/* YB */
+			Oid			yb_table_oid;
 		}			tp;
 
 		/*
@@ -571,6 +579,10 @@ typedef void (*ReorderBufferUpdateProgressTxnCB) (ReorderBuffer *rb,
 												  ReorderBufferTXN *txn,
 												  XLogRecPtr lsn);
 
+typedef void (*YBReorderBufferSchemaChangeCB) (
+											   ReorderBuffer *rb,
+											   Oid relid);
+
 struct ReorderBuffer
 {
 	/*
@@ -613,6 +625,8 @@ struct ReorderBuffer
 	ReorderBufferApplyTruncateCB apply_truncate;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+
+	YBReorderBufferSchemaChangeCB yb_schema_change;
 
 	/*
 	 * Callbacks to be called when streaming a transaction at prepare time.
@@ -782,5 +796,13 @@ extern uint32 ReorderBufferGetInvalidations(ReorderBuffer *rb,
 											SharedInvalidationMessage **msgs);
 
 extern void StartupReorderBuffer(void);
+
+/*
+ * YB: Return a palloc'd array of bool allocated in the reorderbuffer's memory
+ * context to be used for storing yb_is_omitted values for each attribute.
+ */
+bool	   *YBAllocateIsOmittedArray(ReorderBuffer *rb, int nattrs);
+
+void		YBReorderBufferSchemaChange(ReorderBuffer *, Oid relid);
 
 #endif

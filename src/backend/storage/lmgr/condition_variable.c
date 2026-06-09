@@ -78,7 +78,6 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv)
 	proclist_push_tail(&cv->wakeup, pgprocno, cvWaitLink);
 	SpinLockRelease(&cv->mutex);
 }
-
 /*
  * Wait for the given condition variable to be signaled.
  *
@@ -250,6 +249,35 @@ ConditionVariableCancelSleep(void)
 }
 
 /*
+ * Cancel any pending sleep operation for a specific process.
+ *
+ * We just need to remove ourselves from the wait queue of any condition
+ * variable for which we have previously prepared a sleep.
+ *
+ * Do nothing if nothing is pending; this allows this function to be called
+ * during transaction abort to clean up any unfinished CV sleep.
+ *
+ * TODO(#23274): Rewrite / delete YbConditionVariableCancelSleepForProc
+ * YB_TODO_PG19MERGE: this function seems to be adapated from the one above. It
+ * looks like PG changed some stuff, so adding a todo to check if the YB function
+ * needs an update.
+ */
+void
+YbConditionVariableCancelSleepForProc(volatile PGPROC *proc)
+{
+	ConditionVariable *cv = cv_sleep_target;
+
+	if (cv == NULL)
+		return;
+
+	SpinLockAcquire(&cv->mutex);
+	if (proclist_contains(&cv->wakeup, proc->vxid.procNumber, cvWaitLink))
+		proclist_delete(&cv->wakeup, proc->vxid.procNumber, cvWaitLink);
+	SpinLockRelease(&cv->mutex);
+	cv_sleep_target = NULL;
+}
+
+/*
  * Wake up the oldest process sleeping on the CV, if there is any.
  *
  * Note: it's difficult to tell whether this has any real effect: we know
@@ -273,6 +301,12 @@ ConditionVariableSignal(ConditionVariable *cv)
 		SetLatch(&proc->procLatch);
 }
 
+void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	return YbConditionVariableBroadcastForProc(cv, MyProc);
+}
+
 /*
  * Wake up all processes sleeping on the given CV.
  *
@@ -281,9 +315,10 @@ ConditionVariableSignal(ConditionVariable *cv)
  * will typically not get awakened.
  */
 void
-ConditionVariableBroadcast(ConditionVariable *cv)
+YbConditionVariableBroadcastForProc(ConditionVariable *cv,
+									volatile PGPROC *given_proc)
 {
-	int			pgprocno = MyProcNumber;
+	int			pgprocno = given_proc->vxid.procNumber;
 	PGPROC	   *proc = NULL;
 	bool		have_sentinel = false;
 
@@ -309,7 +344,7 @@ ConditionVariableBroadcast(ConditionVariable *cv)
 	 * care of re-establishing the lost state.
 	 */
 	if (cv_sleep_target != NULL)
-		ConditionVariableCancelSleep();
+		YbConditionVariableCancelSleepForProc(given_proc);
 
 	/*
 	 * Inspect the state of the queue.  If it's empty, we have nothing to do.
@@ -356,7 +391,7 @@ ConditionVariableBroadcast(ConditionVariable *cv)
 		have_sentinel = proclist_contains(&cv->wakeup, pgprocno, cvWaitLink);
 		SpinLockRelease(&cv->mutex);
 
-		if (proc != NULL && proc != MyProc)
+		if (proc != NULL && proc != given_proc)
 			SetLatch(&proc->procLatch);
 	}
 }

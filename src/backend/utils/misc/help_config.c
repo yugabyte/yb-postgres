@@ -91,6 +91,15 @@ printMixedStruct(const struct config_generic *structToPrint)
 				   structToPrint->_int.max);
 			break;
 
+		case PGC_OID:
+			/*
+			 * YB_TODO_PG19MERGE: yb_config_oid is YB-only and currently lives
+			 * outside config_generic's union. Until it's folded in, just print
+			 * the type marker without limits.
+			 */
+			printf("OID\t0\t0\t%u\t", (unsigned) UINT_MAX);
+			break;
+
 		case PGC_REAL:
 			printf("REAL\t%g\t%g\t%g\t",
 				   structToPrint->_real.reset_val,

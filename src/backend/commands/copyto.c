@@ -590,10 +590,17 @@ CopySendEndOfRow(CopyToState cstate)
 	{
 		case COPY_FILE:
 			pgstat_report_wait_start(WAIT_EVENT_COPY_TO_WRITE);
+			/* YB_TODO_PG19MERGE: Do we still need YB's wait event? */
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_WRITE);
+
 			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
 					   cstate->copy_file) != 1 ||
 				ferror(cstate->copy_file))
 			{
+				if (IsYugaByteEnabled())
+					pgstat_report_wait_end();
+
 				if (cstate->is_program)
 				{
 					if (errno == EPIPE)
@@ -742,6 +749,9 @@ EndCopy(CopyToState cstate)
 	}
 
 	pgstat_progress_end_command();
+
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_SUCCESS);
 
 	MemoryContextDelete(cstate->copycontext);
 
@@ -1119,6 +1129,9 @@ BeginCopyTo(ParseState *pstate,
 
 	cstate->copy_dest = COPY_FILE;	/* default */
 
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_IN_PROG);
+
 	if (data_dest_cb)
 	{
 		progress_vals[1] = PROGRESS_COPY_TYPE_CALLBACK;
@@ -1335,10 +1348,14 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 	TableScanDesc scandesc;
 	AttrMap    *map = NULL;
 	TupleTableSlot *root_slot = NULL;
+	bool		is_yb_relation;
+	MemoryContext oldcontext = NULL;
+	MemoryContext yb_context = NULL;
 
 	scandesc = table_beginscan(rel, GetActiveSnapshot(), 0, NULL,
 							   SO_NONE);
 	slot = table_slot_create(rel, NULL);
+	is_yb_relation = IsYBRelation(rel);
 
 	/*
 	 * If we are exporting partition data here, we check if converting tuples
@@ -1351,6 +1368,18 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 		map = build_attrmap_by_name_if_req(RelationGetDescr(root_rel),
 										   RelationGetDescr(rel),
 										   false);
+	}
+
+	/*
+	 * Create and switch to a temporary memory context that we can reset
+	 * once per row to recover Yugabyte palloc'd memory.
+	 */
+	if (is_yb_relation)
+	{
+		yb_context = AllocSetContextCreate(CurrentMemoryContext,
+										   "COPY TO (YB)",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(yb_context);
 	}
 
 	while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
@@ -1376,6 +1405,20 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 		 */
 		pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
 									 ++(*processed));
+
+		/* Free Yugabyte memory for this row */
+		if (is_yb_relation)
+			MemoryContextReset(yb_context);
+	}
+
+	/*
+	 * Switch out of and delete the temporary memory context for Yugabyte
+	 * palloc'd memory.
+	 */
+	if (is_yb_relation)
+	{
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(yb_context);
 	}
 
 	ExecDropSingleTupleTableSlot(slot);

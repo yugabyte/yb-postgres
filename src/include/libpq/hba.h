@@ -31,6 +31,7 @@ typedef enum UserAuth
 	uaPassword,
 	uaMD5,
 	uaSCRAM,
+	uaYbTserverKey,				/* For internal tserver-postgres connection */
 	uaGSS,
 	uaSSPI,
 	uaPAM,
@@ -39,7 +40,8 @@ typedef enum UserAuth
 	uaCert,
 	uaPeer,
 	uaOAuth,
-#define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
+	uaYbJWT,
+#define USER_AUTH_LAST uaYbJWT	/* Must be last value of this enum */
 } UserAuth;
 
 /*
@@ -133,6 +135,16 @@ typedef struct HbaLine
 	bool		oauth_skip_usermap;
 	List	   *oauth_opt_keys;
 	List	   *oauth_opt_vals;
+
+	/* YB */
+	char	   *maskedline;
+	char	   *yb_jwt_jwks_path;
+	char	   *yb_jwt_jwks_url;
+	List	   *yb_jwt_audiences;
+	char	   *yb_jwt_audiences_s;
+	List	   *yb_jwt_issuers;
+	char	   *yb_jwt_issuers_s;
+	char	   *yb_jwt_matching_claim_key;
 } HbaLine;
 
 typedef struct IdentLine
@@ -196,7 +208,7 @@ typedef struct TokenizedAuthLine
 typedef struct Port Port;
 
 extern bool load_hba(void);
-extern bool load_ident(void);
+extern bool load_ident(MemoryContext yb_ident_context);
 extern const char *hba_authname(UserAuth auth_method);
 extern void hba_getauthmethod(Port *port);
 extern int	check_usermap(const char *usermap_name,

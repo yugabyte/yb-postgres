@@ -50,6 +50,8 @@
 
 #define Generation_CHUNK_FRACTION	8
 
+#define Generation_CONTEXTSZ	MAXALIGN(sizeof(GenerationContext))
+
 typedef struct GenerationBlock GenerationBlock; /* forward reference */
 
 typedef void *GenerationPointer;
@@ -147,6 +149,11 @@ static inline void GenerationBlockFree(GenerationContext *set,
  * Public routines
  */
 
+/*
+ * YB_TODO_PG19MERGE: upstream PG commit a0cd95448067273a5cf92ad578a1e2de3b62aa2f
+ * did some refactoring in this file, verify YbPgMemSubConsumption,
+ * YbPgMemAddConsumption calls.
+ */
 
 /*
  * GenerationContextCreate
@@ -218,6 +225,8 @@ GenerationContextCreate(MemoryContext parent,
 				 errdetail("Failed while creating memory context \"%s\".",
 						   name)));
 	}
+
+	YbPgMemAddConsumption(allocSize);
 
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
@@ -350,7 +359,10 @@ GenerationDelete(MemoryContext context)
 	VALGRIND_DESTROY_MEMPOOL(context);
 
 	/* And free the context header and keeper block */
+	size_t		freed_sz = context->mem_allocated + Generation_CONTEXTSZ;
+
 	free(context);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -384,6 +396,8 @@ GenerationAllocLarge(MemoryContext context, Size size, int flags)
 	block = (GenerationBlock *) malloc(blksize);
 	if (block == NULL)
 		return MemoryContextAllocationFailure(context, size, flags);
+
+	YbPgMemAddConsumption(blksize);
 
 	/* Make a vchunk covering the new block's header */
 	VALGRIND_MEMPOOL_ALLOC(set, block, Generation_BLOCKHDRSZ);
@@ -509,6 +523,8 @@ GenerationAllocFromNewBlock(MemoryContext context, Size size, int flags,
 
 	if (block == NULL)
 		return MemoryContextAllocationFailure(context, size, flags);
+
+	YbPgMemAddConsumption(blksize);
 
 	/* Make a vchunk covering the new block's header */
 	VALGRIND_MEMPOOL_ALLOC(set, block, Generation_BLOCKHDRSZ);
@@ -698,6 +714,7 @@ GenerationBlockFree(GenerationContext *set, GenerationBlock *block)
 	dlist_delete(&block->node);
 
 	((MemoryContext) set)->mem_allocated -= block->blksize;
+	size_t		freed_sz = block->blksize;
 
 #ifdef CLOBBER_FREED_MEMORY
 	wipe_mem(block, block->blksize);
@@ -707,6 +724,7 @@ GenerationBlockFree(GenerationContext *set, GenerationBlock *block)
 	VALGRIND_MEMPOOL_FREE(set, block);
 
 	free(block);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
