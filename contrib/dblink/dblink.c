@@ -48,6 +48,7 @@
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "libpq-fe.h"
+#include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "parser/scansup.h"
@@ -59,6 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;
 
@@ -97,7 +99,7 @@ static PGresult *storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const
 static void storeRow(volatile storeInfo *sinfo, PGresult *res, bool first);
 static remoteConn *getConnectionByName(const char *name);
 static HTAB *createConnHash(void);
-static void createNewConnection(const char *name, remoteConn *rconn);
+static remoteConn *createNewConnection(const char *name);
 static void deleteConnection(const char *name);
 static char **get_pkey_attnames(Relation rel, int16 *indnkeyatts);
 static char **get_text_array_contents(ArrayType *array, int *numitems);
@@ -110,7 +112,7 @@ static HeapTuple get_tuple_of_interest(Relation rel, int *pkattnums, int pknumat
 static Relation get_rel_from_relname(text *relname_text, LOCKMODE lockmode, AclMode aclmode);
 static char *generate_relation_name(Relation rel);
 static void dblink_connstr_check(const char *connstr);
-static void dblink_security_check(PGconn *conn, remoteConn *rconn);
+static void dblink_security_check(PGconn *conn, const char *connname);
 static void dblink_res_error(PGconn *conn, const char *conname, PGresult *res,
 							 bool fail, const char *fmt,...) pg_attribute_printf(5, 6);
 static char *get_connect_string(const char *servername);
@@ -128,16 +130,22 @@ static remoteConn *pconn = NULL;
 static HTAB *remoteConnHash = NULL;
 
 /*
- *	Following is list that holds multiple remote connections.
+ *	Following is hash that holds multiple remote connections.
  *	Calling convention of each dblink function changes to accept
- *	connection name as the first parameter. The connection list is
+ *	connection name as the first parameter. The connection hash is
  *	much like ecpg e.g. a mapping between a name and a PGconn object.
+ *
+ *	To avoid potentially leaking a PGconn object in case of out-of-memory
+ *	errors, we first create the hash entry, then open the PGconn.
+ *	Hence, a hash entry whose rconn.conn pointer is NULL must be
+ *	understood as a leftover from a failed create; it should be ignored
+ *	by lookup operations, and silently replaced by create operations.
  */
 
 typedef struct remoteConnHashEnt
 {
 	char		name[NAMEDATALEN];
-	remoteConn *rconn;
+	remoteConn	rconn;
 } remoteConnHashEnt;
 
 /* initial number of connection hashes */
@@ -236,7 +244,7 @@ dblink_get_conn(char *conname_or_str,
 					 errmsg("could not establish connection"),
 					 errdetail_internal("%s", msg)));
 		}
-		dblink_security_check(conn, rconn);
+		dblink_security_check(conn, NULL);
 		if (PQclientEncoding(conn) != GetDatabaseEncoding())
 			PQsetClientEncoding(conn, GetDatabaseEncodingName());
 		freeconn = true;
@@ -296,15 +304,6 @@ dblink_connect(PG_FUNCTION_ARGS)
 	else if (PG_NARGS() == 1)
 		conname_or_str = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
-	if (connname)
-	{
-		rconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext,
-												  sizeof(remoteConn));
-		rconn->conn = NULL;
-		rconn->openCursorCount = 0;
-		rconn->newXactForCursor = false;
-	}
-
 	/* first check for valid foreign data server */
 	connstr = get_connect_string(conname_or_str);
 	if (connstr == NULL)
@@ -335,6 +334,13 @@ dblink_connect(PG_FUNCTION_ARGS)
 #endif
 	}
 
+	/* if we need a hashtable entry, make that first, since it might fail */
+	if (connname)
+	{
+		rconn = createNewConnection(connname);
+		Assert(rconn->conn == NULL);
+	}
+
 	/* OK to make connection */
 	conn = PQconnectdb(connstr);
 
@@ -343,8 +349,8 @@ dblink_connect(PG_FUNCTION_ARGS)
 		msg = pchomp(PQerrorMessage(conn));
 		PQfinish(conn);
 		ReleaseExternalFD();
-		if (rconn)
-			pfree(rconn);
+		if (connname)
+			deleteConnection(connname);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
@@ -353,16 +359,16 @@ dblink_connect(PG_FUNCTION_ARGS)
 	}
 
 	/* check password actually used if not superuser */
-	dblink_security_check(conn, rconn);
+	dblink_security_check(conn, connname);
 
 	/* attempt to set client encoding to match server encoding, if needed */
 	if (PQclientEncoding(conn) != GetDatabaseEncoding())
 		PQsetClientEncoding(conn, GetDatabaseEncodingName());
 
+	/* all OK, save away the conn */
 	if (connname)
 	{
 		rconn->conn = conn;
-		createNewConnection(connname, rconn);
 	}
 	else
 	{
@@ -406,10 +412,7 @@ dblink_disconnect(PG_FUNCTION_ARGS)
 	PQfinish(conn);
 	ReleaseExternalFD();
 	if (rconn)
-	{
 		deleteConnection(conname);
-		pfree(rconn);
-	}
 	else
 		pconn->conn = NULL;
 
@@ -478,7 +481,7 @@ dblink_open(PG_FUNCTION_ARGS)
 	/* If we are not in a transaction, start one */
 	if (PQtransactionStatus(conn) == PQTRANS_IDLE)
 	{
-		res = PQexec(conn, "BEGIN");
+		res = libpqsrv_exec(conn, "BEGIN", PG_WAIT_EXTENSION);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			dblink_res_internalerror(conn, res, "begin error");
 		PQclear(res);
@@ -497,7 +500,7 @@ dblink_open(PG_FUNCTION_ARGS)
 		(rconn->openCursorCount)++;
 
 	appendStringInfo(&buf, "DECLARE %s CURSOR FOR %s", curname, sql);
-	res = PQexec(conn, buf.data);
+	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		dblink_res_error(conn, conname, res, fail,
@@ -566,7 +569,7 @@ dblink_close(PG_FUNCTION_ARGS)
 	appendStringInfo(&buf, "CLOSE %s", curname);
 
 	/* close the cursor */
-	res = PQexec(conn, buf.data);
+	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		dblink_res_error(conn, conname, res, fail,
@@ -586,7 +589,7 @@ dblink_close(PG_FUNCTION_ARGS)
 		{
 			rconn->newXactForCursor = false;
 
-			res = PQexec(conn, "COMMIT");
+			res = libpqsrv_exec(conn, "COMMIT", PG_WAIT_EXTENSION);
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				dblink_res_internalerror(conn, res, "commit error");
 			PQclear(res);
@@ -668,7 +671,7 @@ dblink_fetch(PG_FUNCTION_ARGS)
 	 * PGresult will be long-lived even though we are still in a short-lived
 	 * memory context.
 	 */
-	res = PQexec(conn, buf.data);
+	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
 	if (!res ||
 		(PQresultStatus(res) != PGRES_COMMAND_OK &&
 		 PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -816,7 +819,7 @@ dblink_record_internal(FunctionCallInfo fcinfo, bool is_async)
 		else
 		{
 			/* async result retrieval, do it the old way */
-			PGresult   *res = PQgetResult(conn);
+			PGresult   *res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION);
 
 			/* NULL means we're all done with the async results */
 			if (res)
@@ -1127,7 +1130,8 @@ materializeQueryResult(FunctionCallInfo fcinfo,
 		PQclear(sinfo.last_res);
 		PQclear(sinfo.cur_res);
 		/* and clear out any pending data in libpq */
-		while ((res = PQgetResult(conn)) != NULL)
+		while ((res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION)) !=
+			   NULL)
 			PQclear(res);
 		PG_RE_THROW();
 	}
@@ -1154,7 +1158,7 @@ storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const char *sql)
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		sinfo->cur_res = PQgetResult(conn);
+		sinfo->cur_res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION);
 		if (!sinfo->cur_res)
 			break;
 
@@ -1329,6 +1333,9 @@ dblink_get_connections(PG_FUNCTION_ARGS)
 		hash_seq_init(&status, remoteConnHash);
 		while ((hentry = (remoteConnHashEnt *) hash_seq_search(&status)) != NULL)
 		{
+			/* ignore it if it's not an open connection */
+			if (hentry->rconn.conn == NULL)
+				continue;
 			/* stash away current value */
 			astate = accumArrayResult(astate,
 									  CStringGetTextDatum(hentry->name),
@@ -1482,7 +1489,7 @@ dblink_exec(PG_FUNCTION_ARGS)
 		if (!conn)
 			dblink_conn_not_avail(conname);
 
-		res = PQexec(conn, sql);
+		res = libpqsrv_exec(conn, sql, PG_WAIT_EXTENSION);
 		if (!res ||
 			(PQresultStatus(res) != PGRES_COMMAND_OK &&
 			 PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -2567,8 +2574,8 @@ getConnectionByName(const char *name)
 	hentry = (remoteConnHashEnt *) hash_search(remoteConnHash,
 											   key, HASH_FIND, NULL);
 
-	if (hentry)
-		return hentry->rconn;
+	if (hentry && hentry->rconn.conn != NULL)
+		return &hentry->rconn;
 
 	return NULL;
 }
@@ -2585,8 +2592,8 @@ createConnHash(void)
 					   HASH_ELEM | HASH_STRINGS);
 }
 
-static void
-createNewConnection(const char *name, remoteConn *rconn)
+static remoteConn *
+createNewConnection(const char *name)
 {
 	remoteConnHashEnt *hentry;
 	bool		found;
@@ -2600,19 +2607,15 @@ createNewConnection(const char *name, remoteConn *rconn)
 	hentry = (remoteConnHashEnt *) hash_search(remoteConnHash, key,
 											   HASH_ENTER, &found);
 
-	if (found)
-	{
-		PQfinish(rconn->conn);
-		ReleaseExternalFD();
-		pfree(rconn);
-
+	if (found && hentry->rconn.conn != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("duplicate connection name")));
-	}
 
-	hentry->rconn = rconn;
-	strlcpy(hentry->name, name, sizeof(hentry->name));
+	/* New, or reusable, so initialize the rconn struct to zeroes */
+	memset(&hentry->rconn, 0, sizeof(remoteConn));
+
+	return &hentry->rconn;
 }
 
 static void
@@ -2637,7 +2640,7 @@ deleteConnection(const char *name)
 }
 
 static void
-dblink_security_check(PGconn *conn, remoteConn *rconn)
+dblink_security_check(PGconn *conn, const char *connname)
 {
 	if (!superuser())
 	{
@@ -2645,8 +2648,8 @@ dblink_security_check(PGconn *conn, remoteConn *rconn)
 		{
 			PQfinish(conn);
 			ReleaseExternalFD();
-			if (rconn)
-				pfree(rconn);
+			if (connname)
+				deleteConnection(connname);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
@@ -2744,8 +2747,8 @@ dblink_res_error(PGconn *conn, const char *conname, PGresult *res,
 
 	/*
 	 * If we don't get a message from the PGresult, try the PGconn.  This is
-	 * needed because for connection-level failures, PQexec may just return
-	 * NULL, not a PGresult at all.
+	 * needed because for connection-level failures, PQgetResult may just
+	 * return NULL, not a PGresult at all.
 	 */
 	if (message_primary == NULL)
 		message_primary = pchomp(PQerrorMessage(conn));
